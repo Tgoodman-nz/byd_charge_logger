@@ -309,6 +309,8 @@ Then:
 Download CSV:
     http://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN
 
+Note: the full URL including token grants access to your session data — do not share it publicly.
+
 Health check (no token needed):
     http://YOUR_VM_IP:8080/health
 
