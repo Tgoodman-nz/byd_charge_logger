@@ -165,6 +165,7 @@ def correlate(sessions: list[dict], powerpal: list[dict],
         pp_by_minute[key] = row["wh"]
 
     results = []
+    prev_soc_end = None
     for s in sessions:
         # Walk every minute in the session window
         from datetime import timedelta
@@ -203,6 +204,27 @@ def correlate(sessions: list[dict], powerpal: list[dict],
 
         coverage    = round(minutes_matched / minutes_total * 100, 0) if minutes_total else 0
 
+        # Estimated range and efficiency: km driven divided by % used on that leg
+        est_range_km = None
+        km_per_pct   = None
+        try:
+            km  = float(s["km_driven"]) if s.get("km_driven") else None
+            soc = float(s["soc_start"]) if s.get("soc_start") else None
+            if km and soc is not None and prev_soc_end is not None:
+                soc_drop = prev_soc_end - soc
+                if soc_drop >= 2:
+                    est_range_km = round(km / soc_drop * 100)
+                    km_per_pct   = round(km / soc_drop, 1)
+                elif km > 0:
+                    est_range_km = "NA"  # trip too short for reliable reading
+                    km_per_pct   = "NA"
+        except (ValueError, TypeError):
+            pass
+        try:
+            prev_soc_end = float(s["soc_end"]) if s.get("soc_end") else prev_soc_end
+        except (ValueError, TypeError):
+            pass
+
         results.append({
             "session_id":         s["session_id"],
             "date":               s["date"],
@@ -213,6 +235,8 @@ def correlate(sessions: list[dict], powerpal: list[dict],
             "soc_end":            s["soc_end"],
             "odo_end_km":         s.get("odo_end_km", ""),
             "km_driven":          s.get("km_driven", ""),
+            "est_range_km":       est_range_km,
+            "km_per_pct":         km_per_pct,
             "total_kwh":          total_kwh,
             "solar_kwh":          solar_kwh,
             "grid_kwh":           grid_kwh,
@@ -233,9 +257,9 @@ def print_summary(results: list[dict]) -> None:
         print("\nNo sessions to display.")
         return
 
-    W = 132
+    W = 149
     print("\n" + "─" * W)
-    print(f"{'ID':<7} {'Date':<12} {'Start':>6} {'End':>6} {'Odo km':>8} {'SOC%':>9} {'km drv':>7} {'kWh':>6} "
+    print(f"{'ID':<7} {'Date':<12} {'Start':>6} {'End':>6} {'Odo km':>8} {'SOC%':>9} {'km drv':>7} {'~Range':>7} {'km/%':>6} {'kWh':>6} "
           f"{'Solar':>7} {'Grid':>7} {'Solar%':>7} {'Cost $':>7} {'Saving $':>9} {'Coverage':>9}")
     print("─" * W)
 
@@ -254,8 +278,11 @@ def print_summary(results: list[dict]) -> None:
             km_str = f"{float(r['km_driven']):.0f}" if r.get("km_driven") else "—"
         except (ValueError, TypeError):
             km_str = "—"
+        est_range = r.get("est_range_km")
+        rng_str = "NA" if est_range == "NA" else (f"{est_range} km" if est_range else "—")
+        kmpct_str = f"{r['km_per_pct']}" if r.get("km_per_pct") else "—"
         print(f"{r['session_id']:<7} {r['date']:<12} {r['start_local']:>6} {r['end_local']:>6} "
-              f"{odo_str:>8} {soc_str:>9} {km_str:>7} "
+              f"{odo_str:>8} {soc_str:>9} {km_str:>7} {rng_str:>7} {kmpct_str:>6} "
               f"{r['total_kwh']:>6.2f} {r['solar_kwh']:>7.2f} {r['grid_kwh']:>7.2f} "
               f"{r['solar_pct']:>6.1f}% ${r['total_cost']:>6.2f} ${r['saving_vs_grid']:>8.2f}"
               f"  {r['powerpal_coverage']:>6}"
@@ -269,10 +296,11 @@ def print_summary(results: list[dict]) -> None:
     print("─" * W)
     avg_solar_pct = round(total_solar / total_kwh * 100, 1) if total_kwh else 0
     print(f"{'TOTAL':<7} {'':<12} {'':>6} {'':>6} "
-          f"{'':>8} {'':>9} {'':>7} "
+          f"{'':>8} {'':>9} {'':>7} {'':>7} {'':>6} "
           f"{total_kwh:>6.2f} {total_solar:>7.2f} {total_grid:>7.2f} "
           f"{avg_solar_pct:>6.1f}% ${total_cost:>6.2f} ${total_saving:>8.2f}")
     print("─" * W)
+    print("  NA = trip too short to calculate (requires ≥2% SOC drop between sessions)")
     print(f"\n  {len(results)} sessions  |  "
           f"Total charged: {total_kwh:.1f} kWh  |  "
           f"Solar: {total_solar:.1f} kWh ({avg_solar_pct}%)  |  "
