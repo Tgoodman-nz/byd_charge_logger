@@ -289,6 +289,8 @@ Paste:
     WorkingDirectory=/opt/byd_logger
     EnvironmentFile=/opt/byd_logger/.env
     Environment="BYD_BASE_URL=https://dilinkappoversea-au.byd.auto"
+
+Note: all credentials (username, password, token) belong in .env only — never add them as inline Environment= lines in the service file.
     ExecStart=/opt/byd_logger/venv/bin/python byd_logger.py
     Restart=on-failure
     RestartSec=30
@@ -310,6 +312,7 @@ Download CSV:
     http://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN
 
 Note: the full URL including token grants access to your session data — do not share it publicly.
+Note: the server uses HTTP. If the sensitivity of your data is a concern, consider configuring HTTPS on your VM with a certificate (e.g. Let's Encrypt).
 
 Health check (no token needed):
     http://YOUR_VM_IP:8080/health
