@@ -19,6 +19,9 @@ Environment="BYD_REGION=Australia"
 Environment="LOG_FILE=/opt/byd_logger/charge_sessions.csv"
 Environment="POLL_INTERVAL=60"
 Environment="CHARGE_RATE_KW=2.3"
+# TLS cert/key — defaults already point here, only needed if you move the files:
+#Environment="CERT_FILE=/opt/byd_logger/cert.pem"
+#Environment="KEY_FILE=/opt/byd_logger/key.pem"
 
 # Alternatively, store credentials in a protected file:
 # EnvironmentFile=/opt/byd_logger/.env

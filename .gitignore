@@ -5,3 +5,5 @@ powerpal_ble.json
 run.bat
 __pycache__/
 *.pyc
+cert.pem
+key.pem

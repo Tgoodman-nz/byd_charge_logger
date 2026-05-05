@@ -222,7 +222,35 @@ Windows PowerShell:
 
 ---
 
-## Step 9 — Configure Credentials
+## Step 9 — Generate HTTPS Certificate
+
+The server now requires a TLS certificate. Run this once on the VM (replace YOUR_VM_IP with your actual IP):
+
+    sudo openssl req -x509 -newkey rsa:4096 \
+      -keyout /opt/byd_logger/key.pem \
+      -out    /opt/byd_logger/cert.pem \
+      -days 3650 -nodes \
+      -subj "/CN=YOUR_VM_IP" \
+      -addext "subjectAltName=IP:YOUR_VM_IP"
+
+    sudo chown ubuntu:ubuntu /opt/byd_logger/cert.pem /opt/byd_logger/key.pem
+    sudo chmod 640 /opt/byd_logger/key.pem
+
+The `-addext "subjectAltName=IP:..."` line is required — Python's SSL library rejects IP-address certs that only have a CN.
+
+Then download the cert to your local machine (run this from your local terminal, not the VM):
+
+Mac:
+    scp -i ~/.ssh/id_ed25519 ubuntu@YOUR_VM_IP:/opt/byd_logger/cert.pem .
+
+Windows PowerShell:
+    scp -i $env:USERPROFILE\.ssh\id_ed25519 ubuntu@YOUR_VM_IP:/opt/byd_logger/cert.pem .
+
+Place `cert.pem` in the same folder as `correlate.py`. The script finds it automatically.
+
+---
+
+## Step 10 — Configure Credentials
 
     nano /opt/byd_logger/.env
 
@@ -249,7 +277,7 @@ Protect the file:
 
 ---
 
-## Step 10 — Test It
+## Step 11 — Test It
 
     cd /opt/byd_logger
     set -a
@@ -258,7 +286,7 @@ Protect the file:
     venv/bin/python byd_logger.py
 
 You should see:
-    INFO  Web server listening on port 8080
+    INFO  Web server listening on port 8080 (HTTPS)
     INFO  Connecting to BYD API ...
     INFO  Monitoring VIN: LXXXXXXXXXXXXXXXXX
     INFO  Polling every 60 seconds ...
@@ -273,7 +301,7 @@ Press Ctrl+C once confirmed working.
 
 ---
 
-## Step 11 — Install as a System Service
+## Step 12 — Install as a System Service
 
     sudo nano /etc/systemd/system/byd_logger.service
 
@@ -309,13 +337,12 @@ Then:
 ## Accessing Your Data
 
 Download CSV:
-    http://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN
+    https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN
 
 Note: the full URL including token grants access to your session data — do not share it publicly.
-Note: the server uses HTTP. If the sensitivity of your data is a concern, consider configuring HTTPS on your VM with a certificate (e.g. Let's Encrypt).
 
 Health check (no token needed):
-    http://YOUR_VM_IP:8080/health
+    https://YOUR_VM_IP:8080/health
 
 View live logs:
     sudo journalctl -u byd_logger -f
@@ -335,12 +362,12 @@ Once you have run `get_powerpal_key.py` (see [POWERPAL_SETUP.md](POWERPAL_SETUP.
 
 **Windows:**
 ```powershell
-py correlate.py --url "http://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN"
+py correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN"
 ```
 
 **Mac:**
 ```bash
-python3 correlate.py --url "http://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN"
+python3 correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN"
 ```
 
 ### PowerPal data — three options
@@ -404,6 +431,9 @@ See [run.bat.example](run.bat.example) for a ready-to-use Windows shortcut.
 | Charging not detected | chargeState field confusion | Script uses chargeState==1, not chargingState |
 | Session missed after restart | Old version without persistence | Upgrade to latest byd_logger.py |
 | Silent polling stop | MQTT connection timeout | Script now auto-reconnects after 30s timeout |
+| FileNotFoundError cert.pem / key.pem | Cert not generated yet | Run Step 9 commands on the VM |
+| SSL CERTIFICATE_VERIFY_FAILED | cert.pem not alongside correlate.py | Download cert from VM — see Step 9 |
+| hostname mismatch / IP SANs error | Cert generated without -addext SAN | Regenerate cert with the full Step 9 command |
 
 ---
 

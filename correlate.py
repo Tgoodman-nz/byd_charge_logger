@@ -6,7 +6,7 @@ to calculate solar vs grid charging per session.
 
 Usage:
   BYD data — choose one:
-    --url http://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN
+    --url https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN
     --sessions charge_sessions.csv          (local file)
 
   PowerPal data — choose one (in priority order):
@@ -18,7 +18,7 @@ Usage:
 
 Examples:
     # Fully automatic — API credentials loaded from powerpal_ble.json
-    python correlate.py --url "http://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN"
+    python correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN"
 
     # Manual PowerPal CSV export
     python correlate.py --url "..." --powerpal powerpal_data.csv
@@ -37,6 +37,7 @@ Output:
 import argparse
 import csv
 import json
+import ssl
 import sys
 from datetime import datetime
 from io import StringIO
@@ -51,7 +52,11 @@ DEFAULT_FEEDIN_RATE = 0.06   # $/kWh
 
 
 def fetch_url(url: str) -> str:
-    with urllib.request.urlopen(url, timeout=15) as r:
+    ctx = None
+    if url.startswith("https://"):
+        cafile = Path(__file__).parent / "cert.pem"
+        ctx = ssl.create_default_context(cafile=str(cafile))
+    with urllib.request.urlopen(url, timeout=15, context=ctx) as r:
         return r.read().decode("utf-8")
 
 

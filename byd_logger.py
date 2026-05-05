@@ -1,10 +1,10 @@
 """
 BYD Charge Session Logger
 Polls the BYD cloud API and logs charge sessions to a CSV file.
-Also serves the CSV over HTTP with token authentication.
+Also serves the CSV over HTTPS with token authentication.
 
 Access your data at:
-  http://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN
+  https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN
 
 Charging detection: chargeState==1 means actively charging.
 gl field = actual charging power in watts.
@@ -18,6 +18,7 @@ import logging
 import os
 import secrets
 import signal
+import ssl
 from aiohttp import web
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -32,6 +33,8 @@ LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO")
 CHARGE_RATE_KW   = float(os.getenv("CHARGE_RATE_KW", "2.3"))
 WEB_PORT         = int(os.getenv("WEB_PORT", "8080"))
 ACCESS_TOKEN     = os.getenv("ACCESS_TOKEN", "")
+CERT_FILE        = os.getenv("CERT_FILE", "/opt/byd_logger/cert.pem")
+KEY_FILE         = os.getenv("KEY_FILE",  "/opt/byd_logger/key.pem")
 UTC_OFFSET_HOURS = int(os.getenv("UTC_OFFSET_HOURS", "10"))
 REQUEST_TIMEOUT  = 30
 RECONNECT_DELAY  = 60
@@ -213,11 +216,13 @@ async def start_web_server() -> web.AppRunner:
     app.router.add_get("/health", handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(CERT_FILE, KEY_FILE)
+    site = web.TCPSite(runner, "0.0.0.0", WEB_PORT, ssl_context=ssl_ctx)
     await site.start()
-    log.info("Web server listening on port %s", WEB_PORT)
+    log.info("Web server listening on port %s (HTTPS)", WEB_PORT)
     token_preview = (ACCESS_TOKEN[:8] + "...") if ACCESS_TOKEN else "<not set>"
-    log.info("Download URL: http://YOUR_VM_IP:%s/sessions.csv?token=%s",
+    log.info("Download URL: https://YOUR_VM_IP:%s/sessions.csv?token=%s",
              WEB_PORT, token_preview)
     return runner
 
