@@ -1,0 +1,44 @@
+@echo off
+REM ── BYD Charge Logger — Run Commands ─────────────────────────────────────────
+REM
+REM SETUP:
+REM   1. Copy this file to run.bat
+REM   2. Fill in your BYD_URL below (VM IP + access token from your .env)
+REM   3. Run get_powerpal_key.py once to set up automatic PowerPal API access
+REM      (see POWERPAL_SETUP.md for instructions)
+REM   4. Uncomment the command you want to run, save, then double-click run.bat
+REM
+REM NOTE: run.bat is gitignored — your token stays local and is never committed.
+
+REM ── Settings ──────────────────────────────────────────────────────────────────
+set BYD_URL=http://YOUR_VM_IP:8080/sessions.csv?token=YOUR_ACCESS_TOKEN
+set IMPORT_RATE=0.30
+set FEEDIN_RATE=0.06
+set GAS_RATE=0.025
+
+REM ── Power bill data folders (for analyse.py only) ─────────────────────────────
+REM    Point these at folders containing your electricity/gas bill CSV exports
+set ELEC_DIR=C:\path\to\elec_data
+set GAS_DIR=C:\path\to\gas_data
+
+REM ── Commands (remove REM from the one you want to run) ────────────────────────
+
+REM 1. EV session report — auto-fetches PowerPal from API (recommended)
+REM    Requires get_powerpal_key.py to have been run once (see POWERPAL_SETUP.md)
+REM py correlate.py --url "%BYD_URL%" --import-rate %IMPORT_RATE% --feedin-rate %FEEDIN_RATE%
+
+REM 2. EV session report — manual PowerPal CSV export (alternative to API)
+REM    Download CSV from PowerPal app: Guidance → Export my data
+REM py correlate.py --url "%BYD_URL%" --powerpal powerpal_data.csv --import-rate %IMPORT_RATE% --feedin-rate %FEEDIN_RATE%
+
+REM 3. Power bill analysis — electricity + gas bills only
+REM    *** Run quarterly — after receiving a new bill or every ~3 months of data ***
+REM    Correlates solar feed-in with usage across your electricity and gas bills.
+REM    Add new bill CSVs to ELEC_DIR / GAS_DIR before running.
+REM py analyse.py --elec "%ELEC_DIR%" --gas "%GAS_DIR%" --import-rate %IMPORT_RATE% --feedin-rate %FEEDIN_RATE% --gas-rate %GAS_RATE%
+
+REM 4. Power bill analysis — full (includes BYD charging data)
+REM    *** Run quarterly — after receiving a new bill or every ~3 months of data ***
+REM py analyse.py --elec "%ELEC_DIR%" --gas "%GAS_DIR%" --byd "%BYD_URL%" --import-rate %IMPORT_RATE% --feedin-rate %FEEDIN_RATE% --gas-rate %GAS_RATE%
+
+REM ── To run: remove the REM from one command above, save, then double-click ──────

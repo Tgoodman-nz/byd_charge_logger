@@ -1,0 +1,27 @@
+[Unit]
+Description=BYD Charge Session Logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bydlogger
+WorkingDirectory=/opt/byd_logger
+ExecStart=/opt/byd_logger/venv/bin/python byd_logger.py
+Restart=on-failure
+RestartSec=30
+
+# Credentials — edit these or use a separate EnvironmentFile
+Environment="BYD_USERNAME=your@email.com"
+Environment="BYD_PASSWORD=yourpassword"
+Environment="BYD_COUNTRY_CODE=AU"
+Environment="BYD_REGION=Australia"
+Environment="LOG_FILE=/opt/byd_logger/charge_sessions.csv"
+Environment="POLL_INTERVAL=60"
+Environment="CHARGE_RATE_KW=2.3"
+
+# Alternatively, store credentials in a protected file:
+# EnvironmentFile=/opt/byd_logger/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+.env
+*.csv
+session_state.json
+powerpal_ble.json
+run.bat
+__pycache__/
+*.pyc
