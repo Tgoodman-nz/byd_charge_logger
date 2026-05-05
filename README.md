@@ -88,6 +88,7 @@ charge_sessions.csv — one row per completed charging session:
 | range_km | 510 | Estimated range at session end |
 | efficiency_kwh_per_100km | 15.1 | Session efficiency |
 | lifetime_efficiency_kwh_per_100km | 15.3 | BYD lifetime average |
+| location | H | H = home charge, A = away charge. Auto-detected from GPS at session start. Blank for sessions logged before GPS was added (treated as H). |
 | notes | | Free text, edit manually |
 
 session_state.json — written during an active session, deleted when complete.
