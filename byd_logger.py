@@ -15,6 +15,7 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import os
 import secrets
 import signal
@@ -33,9 +34,12 @@ LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO")
 CHARGE_RATE_KW   = float(os.getenv("CHARGE_RATE_KW", "2.3"))
 WEB_PORT         = int(os.getenv("WEB_PORT", "8080"))
 ACCESS_TOKEN     = os.getenv("ACCESS_TOKEN", "")
-CERT_FILE        = os.getenv("CERT_FILE", "/opt/byd_logger/cert.pem")
-KEY_FILE         = os.getenv("KEY_FILE",  "/opt/byd_logger/key.pem")
-UTC_OFFSET_HOURS = int(os.getenv("UTC_OFFSET_HOURS", "10"))
+CERT_FILE          = os.getenv("CERT_FILE",          "/opt/byd_logger/cert.pem")
+KEY_FILE           = os.getenv("KEY_FILE",           "/opt/byd_logger/key.pem")
+UTC_OFFSET_HOURS   = int(os.getenv("UTC_OFFSET_HOURS", "10"))
+HOME_RADIUS_M      = int(os.getenv("HOME_RADIUS_M",    "500"))
+GPS_SESSIONS_FILE  = os.getenv("GPS_SESSIONS_FILE",  "/opt/byd_logger/gps_sessions.json")
+HOME_LOCATION_FILE = os.getenv("HOME_LOCATION_FILE", "/opt/byd_logger/home_location.json")
 REQUEST_TIMEOUT  = 30
 RECONNECT_DELAY  = 60
 # ───────────────────────────────────────────────────────────────────────────
@@ -68,6 +72,7 @@ CSV_HEADERS = [
     "range_km",
     "efficiency_kwh_per_100km",
     "lifetime_efficiency_kwh_per_100km",
+    "location",
     "notes",
 ]
 
@@ -104,13 +109,15 @@ def append_session(row: dict) -> None:
 # ── Session state persistence ───────────────────────────────────────────────
 
 def save_session_state(session_start: datetime, soc_at_start, odo_at_start,
-                       power_readings: list) -> None:
+                       power_readings: list, session_lat=None, session_lon=None) -> None:
     """Write current in-progress session to disk."""
     state = {
         "session_start_utc": session_start.isoformat(),
         "soc_at_start":      soc_at_start,
         "odo_at_start":      odo_at_start,
         "power_readings":    power_readings,
+        "session_lat":       session_lat,
+        "session_lon":       session_lon,
     }
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
@@ -119,7 +126,7 @@ def save_session_state(session_start: datetime, soc_at_start, odo_at_start,
 def load_session_state():
     """Load in-progress session from disk if it exists."""
     if not Path(STATE_FILE).exists():
-        return None, None, None, []
+        return None, None, None, [], None, None
     try:
         with open(STATE_FILE) as f:
             state = json.load(f)
@@ -131,10 +138,12 @@ def load_session_state():
         return (session_start,
                 state["soc_at_start"],
                 state["odo_at_start"],
-                state.get("power_readings", []))
+                state.get("power_readings", []),
+                state.get("session_lat"),
+                state.get("session_lon"))
     except Exception as e:
         log.warning("Could not load session state: %s", e)
-        return None, None, None, []
+        return None, None, None, [], None, None
 
 
 def clear_session_state() -> None:
@@ -143,6 +152,104 @@ def clear_session_state() -> None:
         Path(STATE_FILE).unlink(missing_ok=True)
     except Exception:
         pass
+
+
+# ── GPS and home location ───────────────────────────────────────────────────
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R     = 6_371_000
+    phi1  = math.radians(lat1)
+    phi2  = math.radians(lat2)
+    dphi  = math.radians(lat2 - lat1)
+    dlam  = math.radians(lon2 - lon1)
+    a     = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def load_home_location():
+    if not Path(HOME_LOCATION_FILE).exists():
+        return None
+    try:
+        data = json.loads(Path(HOME_LOCATION_FILE).read_text())
+        return data["lat"], data["lon"]
+    except Exception as e:
+        log.warning("Could not load home location: %s", e)
+        return None
+
+
+def save_home_location(lat: float, lon: float) -> None:
+    try:
+        Path(HOME_LOCATION_FILE).write_text(json.dumps({"lat": lat, "lon": lon}))
+    except Exception as e:
+        log.warning("Could not save home location: %s", e)
+
+
+def load_gps_sessions() -> dict:
+    if not Path(GPS_SESSIONS_FILE).exists():
+        return {}
+    try:
+        return json.loads(Path(GPS_SESSIONS_FILE).read_text())
+    except Exception as e:
+        log.warning("Could not load GPS sessions: %s", e)
+        return {}
+
+
+def save_gps_sessions(sessions: dict) -> None:
+    try:
+        Path(GPS_SESSIONS_FILE).write_text(json.dumps(sessions))
+    except Exception as e:
+        log.warning("Could not save GPS sessions: %s", e)
+
+
+def detect_home(gps_sessions: dict) -> tuple:
+    """Return (lat, lon) of home. Finds closest pair within HOME_RADIUS_M; falls back to first session."""
+    coords = [
+        (v["lat"], v["lon"])
+        for v in gps_sessions.values()
+        if v and v.get("lat") is not None and v.get("lon") is not None
+    ]
+    if len(coords) < 2:
+        return coords[0] if coords else (0.0, 0.0)
+
+    best_dist, best_pair = float("inf"), None
+    for i, a in enumerate(coords):
+        for b in coords[i + 1:]:
+            d = haversine_m(a[0], a[1], b[0], b[1])
+            if d < best_dist:
+                best_dist, best_pair = d, (a, b)
+
+    if best_pair and best_dist <= HOME_RADIUS_M:
+        return ((best_pair[0][0] + best_pair[1][0]) / 2,
+                (best_pair[0][1] + best_pair[1][1]) / 2)
+
+    log.info("No home cluster found (closest pair %.0fm apart) — defaulting to first session", best_dist)
+    return coords[0]
+
+
+def determine_location(session_id: str, lat, lon) -> str:
+    """Return 'H' or 'A'. Defaults to 'H' if GPS unavailable or home not yet established."""
+    if lat is None or lon is None:
+        return "H"
+    try:
+        gps_sessions = load_gps_sessions()
+        gps_sessions[session_id] = {"lat": lat, "lon": lon}
+        save_gps_sessions(gps_sessions)
+
+        home = load_home_location()
+        if home is None:
+            if len(gps_sessions) < 2:
+                return "H"
+            home = detect_home(gps_sessions)
+            save_home_location(*home)
+            log.info("Home location established: %.6f, %.6f", home[0], home[1])
+
+        dist = haversine_m(lat, lon, home[0], home[1])
+        loc  = "H" if dist <= HOME_RADIUS_M else "A"
+        log.info("Session %s: %s (%.0fm from home)", session_id, loc, dist)
+        return loc
+    except Exception as e:
+        log.warning("Location determination failed: %s — defaulting to H", e)
+        return "H"
 
 
 def get_realtime_fields(realtime):
@@ -246,7 +353,8 @@ async def run_polling_session(config, session_count, odo_last_charge):
         log.info("Polling every %s seconds …", POLL_INTERVAL)
 
         # Restore any in-progress session from disk
-        session_start, soc_at_start, odo_at_start, power_readings = load_session_state()
+        session_start, soc_at_start, odo_at_start, power_readings, \
+            session_lat, session_lon = load_session_state()
         was_charging = session_start is not None
 
         if was_charging:
@@ -273,8 +381,20 @@ async def run_polling_session(config, session_count, odo_last_charge):
                     soc_at_start   = soc
                     odo_at_start   = odo
                     power_readings = [gl_watts] if gl_watts > 0 else []
+                    session_lat = session_lon = None
+                    try:
+                        gps = await asyncio.wait_for(
+                            client.get_gps_info(vin), timeout=30)
+                        session_lat = gps.latitude
+                        session_lon = gps.longitude
+                        if session_lat is not None:
+                            log.info("GPS at charge start: %.6f, %.6f",
+                                     session_lat, session_lon)
+                    except Exception as gps_err:
+                        log.debug("GPS unavailable at session start: %s", gps_err)
                     save_session_state(session_start, soc_at_start,
-                                       odo_at_start, power_readings)
+                                       odo_at_start, power_readings,
+                                       session_lat, session_lon)
                     log.info("⚡ Charging started  SOC=%s%%  ODO=%s km  "
                              "power=%.0fW  local=%s",
                              soc, odo, gl_watts, now_local.strftime("%H:%M"))
@@ -285,7 +405,8 @@ async def run_polling_session(config, session_count, odo_last_charge):
                         power_readings.append(gl_watts)
                     # Update persisted power readings periodically
                     save_session_state(session_start, soc_at_start,
-                                       odo_at_start, power_readings)
+                                       odo_at_start, power_readings,
+                                       session_lat, session_lon)
 
                 elif not is_charging and was_charging and session_start is not None:
                     # ── Session ended ──
@@ -293,6 +414,8 @@ async def run_polling_session(config, session_count, odo_last_charge):
                         (now_utc - session_start).total_seconds() / 60, 1)
                     kwh_est        = round(duration_min / 60 * CHARGE_RATE_KW, 3)
                     session_count += 1
+                    location       = determine_location(
+                        f"S{session_count:04d}", session_lat, session_lon)
                     start_local    = to_local(session_start)
 
                     avg_power  = round(sum(power_readings) / len(power_readings), 0) \
@@ -332,6 +455,7 @@ async def run_polling_session(config, session_count, odo_last_charge):
                         "range_km":                          fields["range_km"],
                         "efficiency_kwh_per_100km":          efficiency,
                         "lifetime_efficiency_kwh_per_100km": lifetime_eff,
+                        "location":                          location,
                         "notes":                             "",
                     })
 
@@ -341,6 +465,8 @@ async def run_polling_session(config, session_count, odo_last_charge):
                     soc_at_start    = None
                     odo_at_start    = None
                     power_readings  = []
+                    session_lat     = None
+                    session_lon     = None
                     log.info("✅ Charging ended  SOC=%s%%  ODO=%s km  "
                              "duration=%s min  actual=%s kWh  avg=%sW",
                              soc, odo, duration_min,

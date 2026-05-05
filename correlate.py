@@ -150,6 +150,7 @@ def load_sessions(source: str) -> list[dict]:
                 "odo_end_km":   row.get("odo_end_km", ""),
                 "km_driven":    row.get("km_driven_since_last_charge", ""),
                 "kwh_estimated": float(row.get("kwh_charged_actual") or row.get("kwh_charged_estimated") or 0),
+                "location":     row.get("location", "") or "H",
             })
         except (ValueError, KeyError) as e:
             print(f"  Warning: skipping session row — {e}")
@@ -172,42 +173,54 @@ def correlate(sessions: list[dict], powerpal: list[dict],
     results = []
     prev_soc_end = None
     for s in sessions:
-        # Walk every minute in the session window
         from datetime import timedelta
-        current = s["start"].replace(second=0)
-        end_min = s["end"].replace(second=0)
+        total_kwh  = s["kwh_estimated"]
+        session_wh = total_kwh * 1000
+        location   = s.get("location", "H") or "H"
 
-        grid_wh = 0.0
-        minutes_matched = 0
-        minutes_total   = 0
+        if location == "A":
+            # Away charge — skip PowerPal matching, treat as all-grid
+            grid_kwh   = total_kwh
+            solar_kwh  = 0.0
+            solar_pct  = 0.0
+            solar_cost = 0.0
+            grid_cost  = round(grid_kwh * import_rate, 2)
+            total_cost = grid_cost
+            saving     = 0.0
+            coverage   = "Away"
+            note       = "Away charge"
+        else:
+            # Home charge — match against PowerPal data
+            current = s["start"].replace(second=0)
+            end_min = s["end"].replace(second=0)
 
-        while current <= end_min:
-            minutes_total += 1
-            if current in pp_by_minute:
-                grid_wh += pp_by_minute[current]
-                minutes_matched += 1
-            current += timedelta(minutes=1)
+            grid_wh         = 0.0
+            minutes_matched = 0
+            minutes_total   = 0
 
-        session_wh  = s["kwh_estimated"] * 1000
-        grid_wh     = min(grid_wh, session_wh)          # can't exceed session total
-        solar_wh    = max(session_wh - grid_wh, 0)
+            while current <= end_min:
+                minutes_total += 1
+                if current in pp_by_minute:
+                    grid_wh += pp_by_minute[current]
+                    minutes_matched += 1
+                current += timedelta(minutes=1)
 
-        grid_kwh    = round(grid_wh  / 1000, 3)
-        solar_kwh   = round(solar_wh / 1000, 3)
-        total_kwh   = s["kwh_estimated"]
+            grid_wh   = min(grid_wh, session_wh)
+            solar_wh  = max(session_wh - grid_wh, 0)
+            grid_kwh  = round(grid_wh  / 1000, 3)
+            solar_kwh = round(solar_wh / 1000, 3)
+            solar_pct = round(solar_kwh / total_kwh * 100, 1) if total_kwh > 0 else 0
 
-        solar_pct   = round(solar_kwh / total_kwh * 100, 1) if total_kwh > 0 else 0
+            # Solar cost = opportunity cost; grid cost = what you paid to import
+            solar_cost    = round(solar_kwh * feedin_rate, 2)
+            grid_cost     = round(grid_kwh  * import_rate, 2)
+            total_cost    = round(solar_cost + grid_cost, 2)
+            all_grid_cost = round(total_kwh  * import_rate, 2)
+            saving        = round(all_grid_cost - total_cost, 2)
 
-        # Cost calculation
-        # Solar cost = opportunity cost (what you'd have earned exporting instead)
-        # Grid cost  = what you paid to import
-        solar_cost  = round(solar_kwh * feedin_rate, 2)
-        grid_cost   = round(grid_kwh  * import_rate, 2)
-        total_cost  = round(solar_cost + grid_cost, 2)
-        all_grid_cost = round(total_kwh * import_rate, 2)
-        saving      = round(all_grid_cost - total_cost, 2)
-
-        coverage    = round(minutes_matched / minutes_total * 100, 0) if minutes_total else 0
+            cov_pct  = round(minutes_matched / minutes_total * 100, 0) if minutes_total else 0
+            coverage = f"{cov_pct:.0f}%"
+            note     = "" if cov_pct >= 80 else "⚠ low PowerPal coverage for this window"
 
         # Estimated range and efficiency: km driven divided by % used on that leg
         est_range_km = None
@@ -250,8 +263,8 @@ def correlate(sessions: list[dict], powerpal: list[dict],
             "grid_cost":          grid_cost,
             "total_cost":         total_cost,
             "saving_vs_grid":     saving,
-            "powerpal_coverage":  f"{coverage:.0f}%",
-            "note": "" if coverage >= 80 else "⚠ low PowerPal coverage for this window",
+            "powerpal_coverage":  coverage,
+            "note":               note,
         })
 
     return results
@@ -460,6 +473,13 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
     # ── 7. Charging behaviour ───────────────────────────────────────────────
     print(f"\n  7. CHARGING BEHAVIOUR")
     print(f"  {'─'*40}")
+    home_sessions = [s for s in sessions if (s.get("location") or "H") == "H"]
+    away_sessions = [s for s in sessions if (s.get("location") or "H") == "A"]
+    if away_sessions:
+        print(f"  Home charges:                {len(home_sessions)}  "
+              f"({len(home_sessions)/n_sessions*100:.0f}%)")
+        print(f"  Away charges:                {len(away_sessions)}  "
+              f"({len(away_sessions)/n_sessions*100:.0f}%)")
     day_sessions   = [s for s in sessions
                       if s.get("start") and
                       6 <= s["start"].hour < 20]
