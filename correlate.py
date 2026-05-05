@@ -534,6 +534,201 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
 
     print(f"\n{SEP2}\n")
 
+# ── AEMO spot price / Amber wholesale estimate ──────────────────────────────
+#
+# AEMO publishes 5-minute dispatch prices for each NEM region as monthly CSVs.
+# Files are cached locally so each month is only downloaded once.
+# Amber bills the 30-minute trading price (average of 6 dispatch intervals),
+# but averaging over a full session makes the difference negligible.
+#
+# URL pattern (update AEMO_URL_BASE if AEMO change their data portal):
+#   https://www.aemo.com.au/aemo/data/nem/priceanddemand/PRICE_AND_DEMAND_YYYYMM_REGION1.csv
+
+AEMO_URL_BASE    = "https://www.aemo.com.au/aemo/data/nem/priceanddemand"
+AMBER_CACHE_HDRS = [
+    "session_id", "avg_spot_c_kwh", "min_spot_c_kwh", "max_spot_c_kwh",
+    "negative_price_minutes", "amber_energy_cost", "amber_network_cost",
+    "amber_total_cost", "fixed_total_cost", "amber_saving",
+]
+
+
+def _fetch_aemo_month(year: int, month: int, region: str, cache_dir: Path) -> list[dict]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fname  = f"PRICE_AND_DEMAND_{year:04d}{month:02d}_{region}1.csv"
+    cached = cache_dir / fname
+    if not cached.exists():
+        url = f"{AEMO_URL_BASE}/{fname}"
+        print(f"  Downloading AEMO {region} prices {year}-{month:02d} …")
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                cached.write_bytes(r.read())
+        except Exception as e:
+            print(f"  Warning: could not download AEMO data — {e}")
+            print(f"  If this keeps failing, check {AEMO_URL_BASE}")
+            return []
+    rows = []
+    try:
+        with open(cached, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                period = row.get("PERIODTYPE", "ACTUAL")
+                if period and period != "ACTUAL":
+                    continue
+                try:
+                    dt  = datetime.strptime(row["SETTLEMENTDATE"], "%Y/%m/%d %H:%M:%S")
+                    rrp = float(row["RRP"])
+                    rows.append({"dt": dt, "rrp": rrp})
+                except (ValueError, KeyError):
+                    continue
+    except Exception as e:
+        print(f"  Warning: could not read cached AEMO file {cached}: {e}")
+    return rows
+
+
+def _spot_prices_for_window(start_nem: datetime, end_nem: datetime,
+                             region: str, cache_dir: Path) -> list[dict]:
+    from datetime import timedelta
+    months, cur = set(), start_nem.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end_buf = end_nem + timedelta(minutes=10)
+    while cur <= end_buf:
+        months.add((cur.year, cur.month))
+        cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+    prices = []
+    for y, m in sorted(months):
+        prices.extend(_fetch_aemo_month(y, m, region, cache_dir))
+
+    # SETTLEMENTDATE = end of the 5-minute interval — include intervals overlapping the window
+    return [p for p in prices
+            if start_nem - timedelta(minutes=5) < p["dt"] <= end_nem + timedelta(minutes=5)]
+
+
+def _load_amber_cache(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        with open(path, newline="") as f:
+            return {r["session_id"]: r for r in csv.DictReader(f)}
+    except Exception:
+        return {}
+
+
+def calculate_amber_costs(sessions: list[dict], region: str, network_rate: float,
+                           import_rate: float, utc_offset: int,
+                           cache_path: Path, cache_dir: Path) -> dict:
+    from datetime import timedelta
+    NEM_DELTA = timedelta(hours=10 - utc_offset)  # convert local time → NEM time (UTC+10)
+    cache     = _load_amber_cache(cache_path)
+    new_rows  = []
+
+    to_process = [s for s in sessions if s["session_id"] not in cache]
+    if to_process:
+        print(f"\n  Calculating Amber wholesale costs for {len(to_process)} session(s) …")
+
+    for s in to_process:
+        start_nem = s["start"] + NEM_DELTA
+        end_nem   = s["end"]   + NEM_DELTA
+        kwh       = s["kwh_estimated"]
+
+        prices = _spot_prices_for_window(start_nem, end_nem, region, cache_dir)
+        if not prices:
+            print(f"  Warning: no AEMO prices found for {s['session_id']} "
+                  f"({start_nem} NEM) — skipping")
+            continue
+
+        avg_rrp  = sum(p["rrp"] for p in prices) / len(prices)  # $/MWh
+        min_rrp  = min(p["rrp"] for p in prices)
+        max_rrp  = max(p["rrp"] for p in prices)
+        neg_mins = sum(5 for p in prices if p["rrp"] < 0)
+
+        energy_cost  = round(kwh * avg_rrp / 1000, 2)
+        network_cost = round(kwh * network_rate, 2)
+        amber_total  = round(energy_cost + network_cost, 2)
+        fixed_total  = round(kwh * import_rate, 2)
+        saving       = round(fixed_total - amber_total, 2)
+
+        row = {
+            "session_id":             s["session_id"],
+            "avg_spot_c_kwh":         round(avg_rrp / 10, 2),
+            "min_spot_c_kwh":         round(min_rrp / 10, 2),
+            "max_spot_c_kwh":         round(max_rrp / 10, 2),
+            "negative_price_minutes": neg_mins,
+            "amber_energy_cost":      energy_cost,
+            "amber_network_cost":     network_cost,
+            "amber_total_cost":       amber_total,
+            "fixed_total_cost":       fixed_total,
+            "amber_saving":           saving,
+        }
+        cache[s["session_id"]] = row
+        new_rows.append(row)
+
+    if new_rows:
+        write_header = not cache_path.exists()
+        with open(cache_path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=AMBER_CACHE_HDRS)
+            if write_header:
+                w.writeheader()
+            w.writerows(new_rows)
+        print(f"  Amber cache updated ({len(new_rows)} new row(s)): {cache_path}")
+
+    return cache
+
+
+def print_amber_summary(amber: dict, sessions: list[dict],
+                         region: str, network_rate: float, subscription: float) -> None:
+    rows = [s for s in sessions if s["session_id"] in amber]
+    if not rows:
+        return
+
+    W = 95
+    print(f"\n{'─' * W}")
+    print(f"  AMBER WHOLESALE ESTIMATE  —  region: {region}  "
+          f"network: {network_rate * 100:.1f}c/kWh  "
+          f"subscription: ${subscription:.0f}/mo")
+    print(f"  AEMO 5-min dispatch prices. Amber bills 30-min trading price — estimate only.")
+    print(f"{'─' * W}")
+    print(f"{'ID':<7} {'Date':<12} {'kWh':>5} {'Avg c/kWh':>10} {'Min':>7} {'Max':>7} "
+          f"{'Neg min':>7} {'Fixed $':>8} {'Amber $':>8} {'Saving $':>9}")
+    print(f"{'─' * W}")
+
+    tot_kwh = tot_fixed = tot_amber = tot_saving = 0.0
+    tot_neg = 0
+
+    for s in rows:
+        a       = amber[s["session_id"]]
+        kwh     = s["kwh_estimated"]
+        avg_c   = float(a["avg_spot_c_kwh"])
+        min_c   = float(a["min_spot_c_kwh"])
+        max_c   = float(a["max_spot_c_kwh"])
+        neg_m   = int(a["negative_price_minutes"])
+        fixed   = float(a["fixed_total_cost"])
+        cost    = float(a["amber_total_cost"])
+        saving  = float(a["amber_saving"])
+        neg_str = f"{neg_m}m" if neg_m > 0 else "—"
+        flag    = " ★" if neg_m > 0 else ""
+        print(f"{s['session_id']:<7} {s['date']:<12} {kwh:>5.2f} {avg_c:>9.1f}c "
+              f"{min_c:>6.1f}c {max_c:>6.1f}c {neg_str:>7} "
+              f"${fixed:>7.2f} ${cost:>7.2f} ${saving:>8.2f}{flag}")
+        tot_kwh   += kwh
+        tot_fixed += fixed
+        tot_amber += cost
+        tot_saving += saving
+        tot_neg   += neg_m
+
+    print(f"{'─' * W}")
+    print(f"{'TOTAL':<7} {'':<12} {tot_kwh:>5.2f} {'':>10} {'':>7} {'':>7} "
+          f"{tot_neg:>5}m {'':>2} ${tot_fixed:>7.2f} ${tot_amber:>7.2f} ${tot_saving:>8.2f}")
+    print(f"{'─' * W}")
+
+    months    = len({s["date"][:7] for s in rows})
+    sub_total = round(subscription * months, 2)
+    net       = round(tot_saving - sub_total, 2)
+    print(f"\n  ★ = session had negative-price period (Amber credits you during these minutes)")
+    print(f"  Amber subscription: ${subscription:.0f}/mo × {months} month(s) = ${sub_total:.2f}"
+          f"  (fixed cost, not included in per-session figures above)")
+    verdict = f"CHEAPER by ${net:.2f}" if net > 0 else f"MORE EXPENSIVE by ${abs(net):.2f}"
+    print(f"  Net vs fixed rate (incl. subscription): Amber would have been {verdict}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Correlate BYD charge sessions with PowerPal data")
     parser.add_argument("--powerpal",        help="Path to PowerPal CSV export (alternative to API)")
@@ -546,6 +741,19 @@ def main() -> None:
                         help=f"Grid import rate $/kWh (default {DEFAULT_IMPORT_RATE})")
     parser.add_argument("--feedin-rate",     type=float, default=DEFAULT_FEEDIN_RATE,
                         help=f"Solar feed-in tariff $/kWh (default {DEFAULT_FEEDIN_RATE})")
+    # Amber / AEMO wholesale comparison
+    parser.add_argument("--region",          choices=["QLD", "NSW", "VIC", "SA", "TAS"],
+                        help="NEM region — enables Amber wholesale cost estimate")
+    parser.add_argument("--amber-network-rate", type=float, default=0.09, metavar="RATE",
+                        help="Network/distribution rate $/kWh added on top of spot (default 0.09)")
+    parser.add_argument("--amber-subscription", type=float, default=18.00, metavar="DOLLARS",
+                        help="Amber monthly subscription $ shown in summary (default 18.00)")
+    parser.add_argument("--amber-cache",     default="amber_cache.csv", metavar="FILE",
+                        help="Incremental cache for Amber costs (default amber_cache.csv)")
+    parser.add_argument("--aemo-cache-dir",  default="aemo_cache", metavar="DIR",
+                        help="Directory for cached AEMO monthly price files (default ./aemo_cache)")
+    parser.add_argument("--utc-offset",      type=int, default=10, metavar="HOURS",
+                        help="Your UTC offset: 10 for AEST, 11 for AEDT (default 10)")
     args = parser.parse_args()
 
     if not args.url and not args.sessions:
@@ -590,6 +798,16 @@ def main() -> None:
 
     # Always print EV insights
     print_ev_insights(sessions, results, args.import_rate, args.feedin_rate)
+
+    # Amber wholesale estimate (only if --region provided)
+    if args.region:
+        amber = calculate_amber_costs(
+            sessions, args.region, args.amber_network_rate,
+            args.import_rate, args.utc_offset,
+            Path(args.amber_cache), Path(args.aemo_cache_dir),
+        )
+        print_amber_summary(amber, sessions, args.region,
+                            args.amber_network_rate, args.amber_subscription)
 
 
 if __name__ == "__main__":
