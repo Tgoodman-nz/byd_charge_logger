@@ -535,71 +535,14 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
     print(f"\n{SEP2}\n")
 
 # ── AEMO spot price / Amber wholesale estimate ──────────────────────────────
-#
-# AEMO publishes 5-minute dispatch prices for each NEM region as monthly CSVs.
-# Files are cached locally so each month is only downloaded once.
-# Amber bills the 30-minute trading price (average of 6 dispatch intervals),
-# but averaging over a full session makes the difference negligible.
-#
-# URL pattern (update AEMO_URL_BASE if AEMO change their data portal):
-#   https://www.aemo.com.au/aemo/data/nem/priceanddemand/PRICE_AND_DEMAND_YYYYMM_REGION1.csv
 
-AEMO_URL_BASE    = "https://www.aemo.com.au/aemo/data/nem/priceanddemand"
+from aemo import spot_prices_for_window  # noqa: E402
+
 AMBER_CACHE_HDRS = [
     "session_id", "avg_spot_c_kwh", "min_spot_c_kwh", "max_spot_c_kwh",
     "negative_price_minutes", "amber_energy_cost", "amber_network_cost",
     "amber_total_cost", "fixed_total_cost", "amber_saving",
 ]
-
-
-def _fetch_aemo_month(year: int, month: int, region: str, cache_dir: Path) -> list[dict]:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    fname  = f"PRICE_AND_DEMAND_{year:04d}{month:02d}_{region}1.csv"
-    cached = cache_dir / fname
-    if not cached.exists():
-        url = f"{AEMO_URL_BASE}/{fname}"
-        print(f"  Downloading AEMO {region} prices {year}-{month:02d} …")
-        try:
-            with urllib.request.urlopen(url, timeout=60) as r:
-                cached.write_bytes(r.read())
-        except Exception as e:
-            print(f"  Warning: could not download AEMO data — {e}")
-            print(f"  If this keeps failing, check {AEMO_URL_BASE}")
-            return []
-    rows = []
-    try:
-        with open(cached, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                period = row.get("PERIODTYPE", "ACTUAL")
-                if period and period != "ACTUAL":
-                    continue
-                try:
-                    dt  = datetime.strptime(row["SETTLEMENTDATE"], "%Y/%m/%d %H:%M:%S")
-                    rrp = float(row["RRP"])
-                    rows.append({"dt": dt, "rrp": rrp})
-                except (ValueError, KeyError):
-                    continue
-    except Exception as e:
-        print(f"  Warning: could not read cached AEMO file {cached}: {e}")
-    return rows
-
-
-def _spot_prices_for_window(start_nem: datetime, end_nem: datetime,
-                             region: str, cache_dir: Path) -> list[dict]:
-    from datetime import timedelta
-    months, cur = set(), start_nem.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    end_buf = end_nem + timedelta(minutes=10)
-    while cur <= end_buf:
-        months.add((cur.year, cur.month))
-        cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
-
-    prices = []
-    for y, m in sorted(months):
-        prices.extend(_fetch_aemo_month(y, m, region, cache_dir))
-
-    # SETTLEMENTDATE = end of the 5-minute interval — include intervals overlapping the window
-    return [p for p in prices
-            if start_nem - timedelta(minutes=5) < p["dt"] <= end_nem + timedelta(minutes=5)]
 
 
 def _load_amber_cache(path: Path) -> dict:
@@ -629,7 +572,7 @@ def calculate_amber_costs(sessions: list[dict], region: str, network_rate: float
         end_nem   = s["end"]   + NEM_DELTA
         kwh       = s["kwh_estimated"]
 
-        prices = _spot_prices_for_window(start_nem, end_nem, region, cache_dir)
+        prices = spot_prices_for_window(start_nem, end_nem, region, cache_dir)
         if not prices:
             print(f"  Warning: no AEMO prices found for {s['session_id']} "
                   f"({start_nem} NEM) — skipping")
@@ -719,14 +662,10 @@ def print_amber_summary(amber: dict, sessions: list[dict],
           f"{tot_neg:>5}m {'':>2} ${tot_fixed:>7.2f} ${tot_amber:>7.2f} ${tot_saving:>8.2f}")
     print(f"{'─' * W}")
 
-    months    = len({s["date"][:7] for s in rows})
-    sub_total = round(subscription * months, 2)
-    net       = round(tot_saving - sub_total, 2)
     print(f"\n  ★ = session had negative-price period (Amber credits you during these minutes)")
-    print(f"  Amber subscription: ${subscription:.0f}/mo × {months} month(s) = ${sub_total:.2f}"
-          f"  (fixed cost, not included in per-session figures above)")
-    verdict = f"CHEAPER by ${net:.2f}" if net > 0 else f"MORE EXPENSIVE by ${abs(net):.2f}"
-    print(f"  Net vs fixed rate (incl. subscription): Amber would have been {verdict}")
+    print(f"  Amber ${subscription:.0f}/mo service charge excluded — covers the whole house, not just the car.")
+    verdict = f"CHEAPER by ${tot_saving:.2f}" if tot_saving > 0 else f"MORE EXPENSIVE by ${abs(tot_saving):.2f}"
+    print(f"  Vs fixed rate (excl. service charge): Amber would have been {verdict}")
 
 
 def main() -> None:

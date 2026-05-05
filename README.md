@@ -14,6 +14,7 @@ If you have a BYD EV and a home solar system, this tool helps you answer:
 8. **How much have I saved vs petrol?** — compare electricity cost to equivalent petrol cost per km
 9. **What is my real-world range?** — average km driven per charge cycle in your actual driving patterns
 10. **Should I invest in solar, a battery, or electrify gas appliances?** — payback analysis using your actual data
+11. **Would a wholesale electricity plan cost less?** — compare your fixed rate against AEMO spot prices session-by-session to see if switching to a pass-through retailer like Amber would save money on EV charging
 
 ---
 
@@ -391,6 +392,38 @@ python3 correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKE
 ### Output
 
 Prints a summary table to the terminal showing per-session: odometer, SOC% start→end, km driven, kWh charged, solar vs grid split, cost, and savings. Also saves `correlation_report.csv` and an EV Insights summary covering efficiency, battery health, seasonal variation, cost per km, and savings vs petrol.
+
+### Would wholesale electricity cost less?
+
+Add `--region` to enable the Amber wholesale estimate. For each session, it fetches the actual AEMO spot price from NEMWeb and calculates what you would have paid on a pass-through plan like Amber, compared to your fixed tariff.
+
+**Windows:**
+```powershell
+py correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN" `
+  --region VIC `
+  --import-rate 0.437 `
+  --amber-network-rate 0.09
+```
+
+**Mac:**
+```bash
+python3 correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN" \
+  --region VIC \
+  --import-rate 0.437 \
+  --amber-network-rate 0.09
+```
+
+Replace `VIC` with your NEM region (`QLD`, `NSW`, `VIC`, `SA`, or `TAS`). Set `--import-rate` to your actual fixed tariff from your electricity bill. Set `--amber-network-rate` to the network/distribution component shown on your bill (typically 9–12c/kWh).
+
+| Argument | Default | Description |
+|---|---|---|
+| `--region` | *(off)* | NEM region — required to enable wholesale comparison |
+| `--import-rate` | 0.30 | Your current fixed rate $/kWh |
+| `--amber-network-rate` | 0.09 | Network charge $/kWh (check your bill) |
+| `--amber-subscription` | 18.00 | Amber monthly fee $ — shown in output for reference only |
+| `--utc-offset` | 10 | UTC offset: 10 = AEST, 11 = AEDT |
+
+Results are cached in `amber_cache.csv` — already-priced sessions are never re-fetched, so subsequent runs are instant for existing sessions. AEMO price data is cached in `aemo_cache/`. For a full explanation of how the data is sourced and what the output means, see [AEMO_WHOLESALE.md](AEMO_WHOLESALE.md).
 
 ### Setting up PowerPal API access
 
