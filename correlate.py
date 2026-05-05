@@ -245,6 +245,7 @@ def correlate(sessions: list[dict], powerpal: list[dict],
 
         results.append({
             "session_id":         s["session_id"],
+            "location":           location,
             "date":               s["date"],
             "start_local":        s["start"].strftime("%H:%M"),
             "end_local":          s["end"].strftime("%H:%M"),
@@ -275,9 +276,9 @@ def print_summary(results: list[dict]) -> None:
         print("\nNo sessions to display.")
         return
 
-    W = 149
+    W = 151
     print("\n" + "─" * W)
-    print(f"{'ID':<7} {'Date':<12} {'Start':>6} {'End':>6} {'Odo km':>8} {'SOC%':>9} {'km drv':>7} {'~Range':>7} {'km/%':>6} {'kWh':>6} "
+    print(f"{'ID':<7} {'L':>1} {'Date':<12} {'Start':>6} {'End':>6} {'Odo km':>8} {'SOC%':>9} {'km drv':>7} {'~Range':>7} {'km/%':>6} {'kWh':>6} "
           f"{'Solar':>7} {'Grid':>7} {'Solar%':>7} {'Cost $':>7} {'Saving $':>9} {'Coverage':>9}")
     print("─" * W)
 
@@ -299,7 +300,8 @@ def print_summary(results: list[dict]) -> None:
         est_range = r.get("est_range_km")
         rng_str = "NA" if est_range == "NA" else (f"{est_range} km" if est_range else "—")
         kmpct_str = f"{r['km_per_pct']}" if r.get("km_per_pct") else "—"
-        print(f"{r['session_id']:<7} {r['date']:<12} {r['start_local']:>6} {r['end_local']:>6} "
+        loc_str = r.get("location", "H") or "H"
+        print(f"{r['session_id']:<7} {loc_str:>1} {r['date']:<12} {r['start_local']:>6} {r['end_local']:>6} "
               f"{odo_str:>8} {soc_str:>9} {km_str:>7} {rng_str:>7} {kmpct_str:>6} "
               f"{r['total_kwh']:>6.2f} {r['solar_kwh']:>7.2f} {r['grid_kwh']:>7.2f} "
               f"{r['solar_pct']:>6.1f}% ${r['total_cost']:>6.2f} ${r['saving_vs_grid']:>8.2f}"
@@ -313,7 +315,7 @@ def print_summary(results: list[dict]) -> None:
 
     print("─" * W)
     avg_solar_pct = round(total_solar / total_kwh * 100, 1) if total_kwh else 0
-    print(f"{'TOTAL':<7} {'':<12} {'':>6} {'':>6} "
+    print(f"{'TOTAL':<7} {'':<1} {'':<12} {'':>6} {'':>6} "
           f"{'':>8} {'':>9} {'':>7} {'':>7} {'':>6} "
           f"{total_kwh:>6.2f} {total_solar:>7.2f} {total_grid:>7.2f} "
           f"{avg_solar_pct:>6.1f}% ${total_cost:>6.2f} ${total_saving:>8.2f}")

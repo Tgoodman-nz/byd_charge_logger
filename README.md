@@ -431,6 +431,7 @@ See [run.bat.example](run.bat.example) for a ready-to-use Windows shortcut.
 | Charging not detected | chargeState field confusion | Script uses chargeState==1, not chargingState |
 | Session missed after restart | Old version without persistence | Upgrade to latest byd_logger.py |
 | Silent polling stop | MQTT connection timeout | Script now auto-reconnects after 30s timeout |
+| All sessions show H, no A detected | Home location wrong or GPS unavailable | Delete /opt/byd_logger/home_location.json to reset |
 | FileNotFoundError cert.pem / key.pem | Cert not generated yet | Run Step 9 commands on the VM |
 | SSL CERTIFICATE_VERIFY_FAILED | cert.pem not alongside correlate.py | Download cert from VM — see Step 9 |
 | hostname mismatch / IP SANs error | Cert generated without -addext SAN | Regenerate cert with the full Step 9 command |
@@ -456,3 +457,11 @@ https://github.com/Tgoodman-nz/byd_charge_logger
   May be fixed in a future pyBYD release — reapply after any pybyd upgrade.
 - Session persistence: session_state.json is written every poll during charging.
   If the service restarts mid-session it resumes from the original start time.
+- Home/away detection: GPS coordinates are captured at the start of each charge session.
+  After two sessions within 500m of each other, that location is saved as home in
+  home_location.json. All subsequent sessions are automatically labelled H or A.
+  Sessions with no GPS fix (e.g. car in a garage with no satellite signal) default to H.
+  Existing sessions with no location column are also treated as H.
+  If home detection is wrong, delete /opt/byd_logger/home_location.json on the VM
+  and it will re-detect from the next two sessions. You can also delete
+  gps_sessions.json to clear all stored GPS readings and start fresh.
