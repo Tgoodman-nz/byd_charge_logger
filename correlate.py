@@ -30,8 +30,13 @@ Examples:
     python correlate.py --sessions charge_sessions.csv
 
 Output:
-    correlation_report.csv  — full per-session breakdown
+    correlation_report.csv   — full per-session breakdown (recreated each run)
+    correlation_cache.csv    — persistent PowerPal solar/grid split per session (append-only)
     (also prints a summary table and EV insights to the terminal)
+
+    The cache means PowerPal is only fetched for new sessions — old sessions keep their
+    solar split even after they fall outside the PowerPal API lookback window.
+    Use --recalculate to force a full re-fetch (e.g. after a PowerPal data correction).
 """
 
 import argparse
@@ -64,12 +69,61 @@ POWERPAL_CONFIG = Path(__file__).parent / "powerpal_ble.json"
 POWERPAL_CHUNK_SECS = 30 * 24 * 3600  # 30-day chunks (API limit: 50k records ≈ 34 days)
 
 
-def fetch_powerpal(serial: str, api_key: str, sessions: list) -> list:
-    """Fetch PowerPal readings from the API for the date range covered by sessions."""
+_CORR_CACHE_FIELDS = [
+    "session_id", "solar_kwh", "grid_kwh", "solar_pct",
+    "powerpal_coverage", "powerpal_note",
+]
+
+
+def load_correlation_cache(path: Path) -> dict:
+    """Load cached PowerPal correlations. Returns dict keyed by session_id."""
+    cache = {}
+    if not path.exists():
+        return cache
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            sid = row.get("session_id")
+            if sid:
+                try:
+                    cache[sid] = {
+                        "solar_kwh":         float(row["solar_kwh"]),
+                        "grid_kwh":          float(row["grid_kwh"]),
+                        "solar_pct":         float(row["solar_pct"]),
+                        "powerpal_coverage": row["powerpal_coverage"],
+                        "powerpal_note":     row["powerpal_note"],
+                    }
+                except (KeyError, ValueError):
+                    pass
+    if cache:
+        print(f"  Loaded {len(cache)} cached correlations from {path.name}")
+    return cache
+
+
+def save_correlation_cache(cache: dict, path: Path) -> None:
+    """Write all correlation cache entries to disk."""
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_CORR_CACHE_FIELDS)
+        w.writeheader()
+        for sid, c in cache.items():
+            w.writerow({"session_id": sid, **c})
+
+
+def fetch_powerpal(serial: str, api_key: str, sessions: list,
+                   cache: dict | None = None) -> list:
+    """Fetch PowerPal readings for home sessions not already in the correlation cache."""
     from datetime import timedelta
 
-    start_dt = min(s["start"] for s in sessions) - timedelta(hours=1)
-    end_dt   = max(s["end"]   for s in sessions) + timedelta(hours=1)
+    if cache is None:
+        cache = {}
+    needs_fetch = [s for s in sessions
+                   if (s.get("location", "H") or "H") != "A"
+                   and s["session_id"] not in cache]
+    if not needs_fetch:
+        print("  All home sessions already cached — skipping PowerPal fetch")
+        return []
+
+    start_dt = min(s["start"] for s in needs_fetch) - timedelta(hours=1)
+    end_dt   = max(s["end"]   for s in needs_fetch) + timedelta(hours=1)
 
     rows = []
     t = int(start_dt.timestamp())
@@ -141,6 +195,7 @@ def load_sessions(source: str) -> list[dict]:
             sessions.append({
                 "session_id":   row["session_id"],
                 "date":         date,
+                "date_local":   date,
                 "start":        start,
                 "end":          end,
                 "duration_min": float(row["duration_minutes"]),
@@ -148,9 +203,13 @@ def load_sessions(source: str) -> list[dict]:
                 "soc_end":      row["soc_end_pct"],
                 "odo_start_km": row.get("odo_start_km", ""),
                 "odo_end_km":   row.get("odo_end_km", ""),
-                "km_driven":    row.get("km_driven_since_last_charge", ""),
+                "km_driven":              row.get("km_driven_since_last_charge", ""),
+                "km_driven_since_last_charge": row.get("km_driven_since_last_charge", ""),
                 "kwh_estimated": float(row.get("kwh_charged_actual") or row.get("kwh_charged_estimated") or 0),
                 "location":     row.get("location", "") or "H",
+                "range_km":                    row.get("range_km", ""),
+                "efficiency_kwh_per_100km":    row.get("efficiency_kwh_per_100km", ""),
+                "lifetime_efficiency_kwh_per_100km": row.get("lifetime_efficiency_kwh_per_100km", ""),
             })
         except (ValueError, KeyError) as e:
             print(f"  Warning: skipping session row — {e}")
@@ -161,8 +220,16 @@ def load_sessions(source: str) -> list[dict]:
 
 
 def correlate(sessions: list[dict], powerpal: list[dict],
-              import_rate: float, feedin_rate: float) -> list[dict]:
-    """For each session, sum PowerPal grid import during the window."""
+              import_rate: float, feedin_rate: float,
+              cache: dict | None = None) -> tuple[list[dict], dict]:
+    """Correlate sessions with PowerPal data, using the cache for already-processed sessions.
+
+    Returns (results, updated_cache). Costs are always recalculated from current rates so
+    changing --import-rate / --feedin-rate never requires --recalculate.
+    Sessions with 0% PowerPal coverage are not cached (data gap — will retry next run).
+    """
+    if cache is None:
+        cache = {}
 
     # Build a fast lookup: index PowerPal by minute
     pp_by_minute = {}
@@ -177,18 +244,23 @@ def correlate(sessions: list[dict], powerpal: list[dict],
         total_kwh  = s["kwh_estimated"]
         session_wh = total_kwh * 1000
         location   = s.get("location", "H") or "H"
+        session_id = s["session_id"]
 
         if location == "A":
-            # Away charge — skip PowerPal matching, treat as all-grid
-            grid_kwh   = total_kwh
-            solar_kwh  = 0.0
-            solar_pct  = 0.0
-            solar_cost = 0.0
-            grid_cost  = round(grid_kwh * import_rate, 2)
-            total_cost = grid_cost
-            saving     = 0.0
-            coverage   = "Away"
-            note       = "Away charge"
+            # Away charge — all grid, no PowerPal needed
+            solar_kwh = 0.0
+            grid_kwh  = total_kwh
+            solar_pct = 0.0
+            coverage  = "Away"
+            note      = "Away charge"
+        elif session_id in cache:
+            # Use previously stored correlation
+            c         = cache[session_id]
+            solar_kwh = c["solar_kwh"]
+            grid_kwh  = c["grid_kwh"]
+            solar_pct = c["solar_pct"]
+            coverage  = c["powerpal_coverage"]
+            note      = c["powerpal_note"]
         else:
             # Home charge — match against PowerPal data
             current = s["start"].replace(second=0)
@@ -211,16 +283,26 @@ def correlate(sessions: list[dict], powerpal: list[dict],
             solar_kwh = round(solar_wh / 1000, 3)
             solar_pct = round(solar_kwh / total_kwh * 100, 1) if total_kwh > 0 else 0
 
-            # Solar cost = opportunity cost; grid cost = what you paid to import
-            solar_cost    = round(solar_kwh * feedin_rate, 2)
-            grid_cost     = round(grid_kwh  * import_rate, 2)
-            total_cost    = round(solar_cost + grid_cost, 2)
-            all_grid_cost = round(total_kwh  * import_rate, 2)
-            saving        = round(all_grid_cost - total_cost, 2)
-
             cov_pct  = round(minutes_matched / minutes_total * 100, 0) if minutes_total else 0
             coverage = f"{cov_pct:.0f}%"
             note     = "" if cov_pct >= 80 else "⚠ low PowerPal coverage for this window"
+
+            # Only cache if PowerPal actually had data for this window
+            if minutes_matched > 0:
+                cache[session_id] = {
+                    "solar_kwh":         solar_kwh,
+                    "grid_kwh":          grid_kwh,
+                    "solar_pct":         solar_pct,
+                    "powerpal_coverage": coverage,
+                    "powerpal_note":     note,
+                }
+
+        # Costs always recalculated from current rates
+        solar_cost    = round(solar_kwh * feedin_rate, 2)
+        grid_cost     = round(grid_kwh  * import_rate, 2)
+        total_cost    = round(solar_cost + grid_cost, 2)
+        all_grid_cost = round(total_kwh  * import_rate, 2)
+        saving        = round(all_grid_cost - total_cost, 2)
 
         # Estimated range and efficiency: km driven divided by % used on that leg
         est_range_km = None
@@ -268,7 +350,7 @@ def correlate(sessions: list[dict], powerpal: list[dict],
             "note":               note,
         })
 
-    return results
+    return results, cache
 
 
 def print_summary(results: list[dict]) -> None:
@@ -340,7 +422,7 @@ def save_report(results: list[dict], output_path: str) -> None:
 
 
 def print_ev_insights(sessions: list[dict], results: list[dict],
-                      import_rate: float, feedin_rate: float) -> None:
+                      import_rate: float, feedin_rate: float = 0.0) -> None:
     """
     Print a summary answering the key EV questions:
     1. How much power does the car use?
@@ -356,7 +438,6 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
     if not sessions:
         return
 
-    SEP  = "─" * 68
     SEP2 = "═" * 68
     PETROL_RATE_PER_L  = 2.00   # $/litre — update with current price
     PETROL_L_PER_100KM = 8.5    # typical petrol car litres/100km
@@ -379,25 +460,28 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
     print(f"  Average per session:         {total_kwh/n_sessions:.1f} kWh")
 
     # ── 2. Efficiency per km ────────────────────────────────────────────────
+    # Uses cumulative totals (total kWh / total km) rather than averaging per-session
+    # ratios, which are skewed by partial top-ups on a slow EVSE.
     print(f"\n  2. EFFICIENCY (kWh/100km)")
     print(f"  {'─'*40}")
-    eff_sessions = [s for s in sessions
-                    if s.get("efficiency_kwh_per_100km") and
-                    str(s["efficiency_kwh_per_100km"]).replace(".","").isdigit()]
-    if eff_sessions:
-        efficiencies = [float(s["efficiency_kwh_per_100km"]) for s in eff_sessions]
-        avg_eff = sum(efficiencies) / len(efficiencies)
-        print(f"  Average efficiency:          {avg_eff:.1f} kWh/100km")
-        print(f"  Best session:                {min(efficiencies):.1f} kWh/100km")
-        print(f"  Worst session:               {max(efficiencies):.1f} kWh/100km")
-        # Latest lifetime from BYD
-        lifetime_effs = [s["lifetime_efficiency_kwh_per_100km"]
-                         for s in sessions
-                         if s.get("lifetime_efficiency_kwh_per_100km")]
-        if lifetime_effs:
-            print(f"  BYD lifetime average:        {lifetime_effs[-1]} kWh/100km")
+    if total_km > 0 and total_kwh > 0:
+        overall_eff = total_kwh / total_km * 100
+        print(f"  From logs:                   {overall_eff:.1f} kWh/100km")
+        print(f"  (based on {total_kwh:.1f} kWh charged over {total_km:.0f} km logged)")
     else:
         print(f"  Not enough data yet — need km_driven to calculate")
+    lifetime_effs = [s["lifetime_efficiency_kwh_per_100km"]
+                     for s in sessions
+                     if s.get("lifetime_efficiency_kwh_per_100km")]
+    if lifetime_effs:
+        print(f"  From car (all-time):         {lifetime_effs[-1]} kWh/100km")
+        if total_km > 0 and total_kwh > 0:
+            try:
+                gap = overall_eff - float(lifetime_effs[-1])
+                print(f"  Gap:                         {gap:+.1f} kWh/100km  "
+                      f"(logs include charging losses; car measures battery output)")
+            except (ValueError, TypeError):
+                pass
 
     # ── 3. Battery degradation indicators ───────────────────────────────────
     print(f"\n  3. BATTERY HEALTH INDICATORS")
@@ -453,22 +537,27 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
     # ── 6. Seasonal efficiency ──────────────────────────────────────────────
     print(f"\n  6. SEASONAL EFFICIENCY")
     print(f"  {'─'*40}")
-    seasonal = {"Summer":{}, "Autumn":{}, "Winter":{}, "Spring":{}}
-    for s in eff_sessions:
+    seasonal = {s: {"kwh": 0.0, "km": 0.0, "n": 0}
+                for s in ("Summer", "Autumn", "Winter", "Spring")}
+    for s in sessions:
         try:
+            km = float(s["km_driven_since_last_charge"])
+            if km <= 0:
+                continue
             month = int(s["date_local"].split("-")[1])
-            eff   = float(s["efficiency_kwh_per_100km"])
-            if month in [12,1,2]:   season = "Summer"
-            elif month in [3,4,5]:  season = "Autumn"
-            elif month in [6,7,8]:  season = "Winter"
-            else:                   season = "Spring"
-            seasonal[season].setdefault("effs", []).append(eff)
+            if month in [12,1,2]:   bucket = "Summer"
+            elif month in [3,4,5]:  bucket = "Autumn"
+            elif month in [6,7,8]:  bucket = "Winter"
+            else:                   bucket = "Spring"
+            seasonal[bucket]["kwh"] += s.get("kwh_estimated", 0)
+            seasonal[bucket]["km"]  += km
+            seasonal[bucket]["n"]   += 1
         except Exception:
             pass
     for season, data in seasonal.items():
-        effs = data.get("effs", [])
-        if effs:
-            print(f"  {season:<10} avg {sum(effs)/len(effs):.1f} kWh/100km  ({len(effs)} sessions)")
+        if data["km"] > 0:
+            eff = data["kwh"] / data["km"] * 100
+            print(f"  {season:<10} {eff:.1f} kWh/100km  ({data['n']} sessions, {data['km']:.0f} km)")
         else:
             print(f"  {season:<10} no data yet")
 
@@ -486,9 +575,9 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
                       if s.get("start") and
                       6 <= s["start"].hour < 20]
     night_sessions = [s for s in sessions if s not in day_sessions]
-    soc_starts = [float(s["soc_start_pct"]) for s in sessions
-                  if s.get("soc_start_pct") and
-                  str(s["soc_start_pct"]).replace(".","").isdigit()]
+    soc_starts = [float(s["soc_start"]) for s in sessions
+                  if s.get("soc_start") and
+                  str(s["soc_start"]).replace(".","").isdigit()]
     print(f"  Day charges (6am-8pm):       {len(day_sessions)}  "
           f"({len(day_sessions)/n_sessions*100:.0f}% — likely solar)")
     print(f"  Night charges (8pm-6am):     {len(night_sessions)}  "
@@ -693,6 +782,10 @@ def main() -> None:
                         help="Directory for cached AEMO monthly price files (default ./aemo_cache)")
     parser.add_argument("--utc-offset",      type=int, default=10, metavar="HOURS",
                         help="Your UTC offset: 10 for AEST, 11 for AEDT (default 10)")
+    parser.add_argument("--correlation-cache", default="correlation_cache.csv", metavar="FILE",
+                        help="Persistent PowerPal correlation cache (default correlation_cache.csv)")
+    parser.add_argument("--recalculate",     action="store_true",
+                        help="Ignore cache and re-fetch PowerPal for all sessions")
     args = parser.parse_args()
 
     if not args.url and not args.sessions:
@@ -709,6 +802,9 @@ def main() -> None:
         print("No sessions found. Is the BYD logger running?")
         sys.exit(0)
 
+    cache_path = Path(args.correlation_cache)
+    cache = {} if args.recalculate else load_correlation_cache(cache_path)
+
     # Resolve PowerPal credentials from args or powerpal_ble.json
     serial  = args.powerpal_serial
     api_key = args.powerpal_key
@@ -721,16 +817,22 @@ def main() -> None:
     if args.powerpal:
         powerpal = load_powerpal(args.powerpal)
         print(f"\nCorrelating (import={args.import_rate} $/kWh, feedin={args.feedin_rate} $/kWh) …")
-        results = correlate(sessions, powerpal, args.import_rate, args.feedin_rate)
+        results, cache = correlate(sessions, powerpal, args.import_rate, args.feedin_rate, cache)
+        save_correlation_cache(cache, cache_path)
         print_summary(results)
         save_report(results, args.output)
     elif serial and api_key:
-        powerpal = fetch_powerpal(serial, api_key, sessions)
-        if powerpal:
-            print(f"\nCorrelating (import={args.import_rate} $/kWh, feedin={args.feedin_rate} $/kWh) …")
-            results = correlate(sessions, powerpal, args.import_rate, args.feedin_rate)
-            print_summary(results)
-            save_report(results, args.output)
+        powerpal = fetch_powerpal(serial, api_key, sessions, cache)
+        print(f"\nCorrelating (import={args.import_rate} $/kWh, feedin={args.feedin_rate} $/kWh) …")
+        results, cache = correlate(sessions, powerpal, args.import_rate, args.feedin_rate, cache)
+        save_correlation_cache(cache, cache_path)
+        print_summary(results)
+        save_report(results, args.output)
+    elif cache:
+        print(f"\nCorrelating from cache (import={args.import_rate} $/kWh, feedin={args.feedin_rate} $/kWh) …")
+        results, _ = correlate(sessions, [], args.import_rate, args.feedin_rate, cache)
+        print_summary(results)
+        save_report(results, args.output)
     else:
         print("\n  No PowerPal data — skipping solar/grid correlation")
         print("  Run get_powerpal_key.py for automatic API access, or pass --powerpal <csv>")

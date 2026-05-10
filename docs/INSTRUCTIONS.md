@@ -17,6 +17,14 @@ electric switch makes financial sense.
 | `requirements.txt` | Python dependencies |
 | `README.md` | Full deployment guide for the Oracle VM |
 
+### Household electricity tools (not BYD-specific)
+
+| File | Purpose |
+|---|---|
+| `nem12_wholesale.py` | Compares 1–2 years of NEM12 interval meter data against AEMO wholesale spot prices — answers "would I save on Amber?" See [NEM12_WHOLESALE.md](NEM12_WHOLESALE.md) |
+| `aemo.py` | Shared module — fetches and caches AEMO 5-min dispatch prices from NEMWeb. Used by both `correlate.py` and `nem12_wholesale.py` |
+| `bills.csv` | Your quarterly bill history — period dates, actual amount paid, govt relief. Used by `nem12_wholesale.py` |
+
 ---
 
 ## System Overview

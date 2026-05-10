@@ -360,7 +360,7 @@ View last 50 lines:
 
 ### Quick start (fully automatic)
 
-Once you have run `get_powerpal_key.py` (see [POWERPAL_SETUP.md](POWERPAL_SETUP.md)), credentials are saved to `powerpal_ble.json` and everything is automatic:
+Once you have run `get_powerpal_key.py` (see [POWERPAL_SETUP.md](docs/POWERPAL_SETUP.md)), credentials are saved to `powerpal_ble.json` and everything is automatic:
 
 **Windows:**
 ```powershell
@@ -423,11 +423,11 @@ Replace `VIC` with your NEM region (`QLD`, `NSW`, `VIC`, `SA`, or `TAS`). Set `-
 | `--amber-subscription` | 18.00 | Amber monthly fee $ — shown in output for reference only |
 | `--utc-offset` | 10 | UTC offset: 10 = AEST, 11 = AEDT |
 
-Results are cached in `amber_cache.csv` — already-priced sessions are never re-fetched, so subsequent runs are instant for existing sessions. AEMO price data is cached in `aemo_cache/`. For a full explanation of how the data is sourced and what the output means, see [AEMO_WHOLESALE.md](AEMO_WHOLESALE.md).
+Results are cached in `amber_cache.csv` — already-priced sessions are never re-fetched, so subsequent runs are instant for existing sessions. AEMO price data is cached in `aemo_cache/`. For a full explanation of how the data is sourced and what the output means, see [AEMO_WHOLESALE.md](docs/AEMO_WHOLESALE.md).
 
 ### Setting up PowerPal API access
 
-See [POWERPAL_SETUP.md](POWERPAL_SETUP.md) for step-by-step instructions to retrieve your PowerPal API key via Bluetooth. This is a one-time setup — covers both Windows and Mac.
+See [POWERPAL_SETUP.md](docs/POWERPAL_SETUP.md) for step-by-step instructions to retrieve your PowerPal API key via Bluetooth. This is a one-time setup — covers both Windows and Mac.
 
 ---
 
@@ -448,6 +448,25 @@ py analyse.py --elec "C:\path\to\elec_data" --gas "C:\path\to\gas_data" --byd "%
 ```
 
 See [run.bat.example](run.bat.example) for a ready-to-use Windows shortcut.
+
+---
+
+## Electricity Retailer Comparison — nem12_wholesale.py
+
+> **Not BYD-specific** — this tool compares your overall household electricity costs across your fixed-rate retailer vs a wholesale spot-price plan (e.g. Amber Electric). It uses your full NEM12 interval meter data, not just EV charging sessions.
+
+`nem12_wholesale.py` reads 1–2 years of 5-minute interval meter data (NEM12 format, available from your retailer) and calculates what your entire household electricity bill would have looked like on a wholesale pass-through plan, using actual AEMO spot prices. It compares against your real quarterly bills to give a definitive answer on whether switching would save money.
+
+```bash
+python nem12_wholesale.py nem12_file.csv --region VIC --fixed-rate 0.437 --bill-csv bills.csv
+```
+
+Key outputs:
+- **Cost comparison** — total import cost at spot vs fixed rate, including solar feed-in at spot (which can be negative during oversupply)
+- **Monthly breakdown** — month-by-month spot vs fixed with EA and Amber feed-in side by side, showing which months are risky (cold-snap winter peaks) vs cheap (solar oversupply)
+- **Actual bill comparison** — your real quarterly bills vs what Amber would have charged for the same period, net of govt relief and supply charges
+
+For full usage, arguments, and interpretation see [docs/NEM12_WHOLESALE.md](docs/NEM12_WHOLESALE.md).
 
 ---
 

@@ -31,6 +31,7 @@ Caching
   so newly published days are always picked up).
 """
 
+import calendar
 import csv
 import urllib.request
 import zipfile
@@ -118,55 +119,20 @@ def _read_dispatch_cache(cached: Path) -> list[dict]:
     return rows
 
 
-def _fetch_aemo_month(year: int, month: int, region: str, cache_dir: Path) -> list[dict]:
-    """Return AEMO dispatch prices for a month, downloading if not already cached."""
-    key = (year, month, region)
-    if key in _aemo_month_cache:
-        return _aemo_month_cache[key]
+def _fetch_via_dispatchis(year: int, month: int, region: str, key: tuple,
+                          cache_path: Path | None = None) -> list[dict]:
+    """Fetch a month via DispatchIS daily ZIPs — used for current and recent unpublished months.
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    today = date.today()
-    is_current_month = (year == today.year and month == today.month)
-    cached = cache_dir / f"DISPATCHPRICE_{year:04d}{month:02d}_{region}.csv"
+    If cache_path is provided the result is written to disk (for completed months only).
+    """
+    today     = date.today()
+    last_day  = today.day if (year == today.year and month == today.month) \
+                else calendar.monthrange(year, month)[1]
 
-    if not is_current_month and cached.exists():
-        rows = _read_dispatch_cache(cached)
-        _aemo_month_cache[key] = rows
-        return rows
-
-    if not is_current_month:
-        # MMSDM monthly archive — only available for completed months
-        # %23 = URL-encoded # (required — bare # is treated as fragment)
-        zip_name = f"PUBLIC_ARCHIVE%23DISPATCHPRICE%23FILE01%23{year:04d}{month:02d}010000.zip"
-        url = (f"https://www.nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM"
-               f"/{year:04d}/MMSDM_{year:04d}_{month:02d}"
-               f"/MMSDM_Historical_Data_SQLLoader/DATA/{zip_name}")
-        print(f"  Downloading AEMO {region} prices {year}-{month:02d} …")
-        try:
-            with urllib.request.urlopen(url, timeout=120) as r:
-                zip_bytes = r.read()
-        except Exception as e:
-            print(f"  Warning: could not download AEMO data — {e}")
-            _aemo_month_cache[key] = []
-            return []
-        filtered = _parse_mmsdm_zip(zip_bytes, region)
-        if filtered is None:
-            _aemo_month_cache[key] = []
-            return []
-        with open(cached, "w", newline="") as f:
-            f.write("SETTLEMENTDATE,RRP\n")
-            f.write("\n".join(filtered))
-        print(f"  Cached {len(filtered):,} dispatch intervals for {region}")
-        rows = _read_dispatch_cache(cached)
-        _aemo_month_cache[key] = rows
-        return rows
-
-    # Current month — DispatchIS daily ZIPs, published same-day, no disk cache
-    # (re-downloaded each run so newly published days are always included)
     print(f"  Downloading DispatchIS daily prices for {region} {year}-{month:02d} …")
     all_filtered = []
-    for day in range(1, today.day + 1):
-        d = date(year, month, day)
+    for day in range(1, last_day + 1):
+        d       = date(year, month, day)
         day_url = (f"https://www.nemweb.com.au/Reports/ARCHIVE/DispatchIS_Reports/"
                    f"PUBLIC_DISPATCHIS_{d.strftime('%Y%m%d')}.zip")
         try:
@@ -189,13 +155,77 @@ def _fetch_aemo_month(year: int, month: int, region: str, cache_dir: Path) -> li
     for line in all_filtered:
         try:
             parts = line.split(",", 1)
-            dt  = datetime.strptime(parts[0], "%Y/%m/%d %H:%M:%S")
-            rrp = float(parts[1])
+            dt    = datetime.strptime(parts[0], "%Y/%m/%d %H:%M:%S")
+            rrp   = float(parts[1])
             rows.append({"dt": dt, "rrp": rrp})
         except (ValueError, IndexError):
             continue
+
+    if cache_path is not None:
+        with open(cache_path, "w", newline="") as f:
+            f.write("SETTLEMENTDATE,RRP\n")
+            for r in rows:
+                f.write(f"{r['dt'].strftime('%Y/%m/%d %H:%M:%S')},{r['rrp']}\n")
+        print(f"  Cached {len(rows):,} dispatch intervals for {region} {year}-{month:02d}")
+
     _aemo_month_cache[key] = rows
     return rows
+
+
+def _fetch_aemo_month(year: int, month: int, region: str, cache_dir: Path) -> list[dict]:
+    """Return AEMO dispatch prices for a month, downloading if not already cached."""
+    key = (year, month, region)
+    if key in _aemo_month_cache:
+        return _aemo_month_cache[key]
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    today = date.today()
+    is_current_month = (year == today.year and month == today.month)
+    cached = cache_dir / f"DISPATCHPRICE_{year:04d}{month:02d}_{region}.csv"
+
+    if not is_current_month and cached.exists():
+        rows = _read_dispatch_cache(cached)
+        _aemo_month_cache[key] = rows
+        return rows
+
+    if not is_current_month:
+        # MMSDM monthly archive — filename format changed after July 2024.
+        # Pre-Aug 2024: PUBLIC_DVD_DISPATCHPRICE_YYYYMM010000.zip
+        # Aug 2024+:    PUBLIC_ARCHIVE#DISPATCHPRICE#FILE01#YYYYMM010000.zip (%23 = URL-encoded #)
+        if (year, month) <= (2024, 7):
+            zip_name = f"PUBLIC_DVD_DISPATCHPRICE_{year:04d}{month:02d}010000.zip"
+        else:
+            zip_name = f"PUBLIC_ARCHIVE%23DISPATCHPRICE%23FILE01%23{year:04d}{month:02d}010000.zip"
+        url = (f"https://www.nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM"
+               f"/{year:04d}/MMSDM_{year:04d}_{month:02d}"
+               f"/MMSDM_Historical_Data_SQLLoader/DATA/{zip_name}")
+        print(f"  Downloading AEMO {region} prices {year}-{month:02d} …")
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r:
+                zip_bytes = r.read()
+        except Exception as e:
+            if "404" in str(e):
+                # MMSDM archive not yet published — fall back to DispatchIS daily
+                print(f"  MMSDM not yet published for {year}-{month:02d}, trying DispatchIS …")
+                return _fetch_via_dispatchis(year, month, region, key, cache_path=cached)
+            print(f"  Warning: could not download AEMO data — {e}")
+            _aemo_month_cache[key] = []
+            return []
+        filtered = _parse_mmsdm_zip(zip_bytes, region)
+        if filtered is None:
+            _aemo_month_cache[key] = []
+            return []
+        with open(cached, "w", newline="") as f:
+            f.write("SETTLEMENTDATE,RRP\n")
+            f.write("\n".join(filtered))
+        print(f"  Cached {len(filtered):,} dispatch intervals for {region}")
+        rows = _read_dispatch_cache(cached)
+        _aemo_month_cache[key] = rows
+        return rows
+
+    # Current month — no MMSDM archive yet; use DispatchIS daily ZIPs
+    # (re-downloaded each run so newly published days are always included)
+    return _fetch_via_dispatchis(year, month, region, key)
 
 
 def spot_prices_for_window(start_nem: datetime, end_nem: datetime,
