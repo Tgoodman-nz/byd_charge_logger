@@ -19,7 +19,7 @@ It fetches actual AEMO spot prices for your full data period, calculates what gr
 ## Quick Start
 
 ```bash
-python nem12_wholesale.py nem12_file.csv --region VIC --fixed-rate 0.437 --bill-csv bills.csv
+py nem12_wholesale.py nem12_file.csv --region VIC --fixed-rate 0.437 --bill-csv bills.csv
 ```
 
 AEMO price data downloads automatically and is cached locally — subsequent runs are fast.

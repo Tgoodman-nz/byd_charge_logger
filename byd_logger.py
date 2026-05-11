@@ -82,10 +82,31 @@ def to_local(dt: datetime) -> datetime:
 
 
 def ensure_csv(path: str) -> None:
-    if not Path(path).exists():
+    p = Path(path)
+    if not p.exists():
         with open(path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=CSV_HEADERS).writeheader()
         log.info("Created log file: %s", path)
+        return
+    with open(path, newline="") as f:
+        raw_rows = list(csv.reader(f))
+    if not raw_rows:
+        return
+    old_headers = raw_rows[0]
+    if old_headers != CSV_HEADERS:
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
+            writer.writeheader()
+            for raw in raw_rows[1:]:
+                # Map values by old header position, then fill extras positionally
+                row = {old_headers[i]: raw[i]
+                       for i in range(min(len(old_headers), len(raw)))}
+                extras = raw[len(old_headers):]
+                # location was appended after the original header — pick it up positionally
+                if "location" not in old_headers and extras:
+                    row["location"] = extras[0]
+                writer.writerow({k: row.get(k, "") for k in CSV_HEADERS})
+        log.info("Repaired CSV headers: %s", path)
 
 
 def append_session(row: dict) -> None:
