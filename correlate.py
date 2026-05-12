@@ -364,7 +364,7 @@ def print_summary(results: list[dict]) -> None:
           f"{'Solar':>7} {'Grid':>7} {'Solar%':>7} {'Cost $':>7} {'Saving $':>9} {'Coverage':>9}")
     print("─" * W)
 
-    total_kwh = total_solar = total_grid = total_cost = total_saving = 0.0
+    total_kwh = total_solar = total_grid = total_cost = total_saving = total_km = 0.0
 
     for r in results:
         try:
@@ -376,8 +376,10 @@ def print_summary(results: list[dict]) -> None:
         except (ValueError, TypeError):
             soc_str = "—"
         try:
-            km_str = f"{float(r['km_driven']):.0f}" if r.get("km_driven") else "—"
+            km_val = float(r['km_driven']) if r.get("km_driven") else None
+            km_str = f"{km_val:.0f}" if km_val is not None else "—"
         except (ValueError, TypeError):
+            km_val = None
             km_str = "—"
         est_range = r.get("est_range_km")
         rng_str = "NA" if est_range == "NA" else (f"{est_range} km" if est_range else "—")
@@ -394,20 +396,24 @@ def print_summary(results: list[dict]) -> None:
         total_grid   += r["grid_kwh"]
         total_cost   += r["total_cost"]
         total_saving += r["saving_vs_grid"]
+        if km_val is not None:
+            total_km += km_val
 
     print("─" * W)
     avg_solar_pct = round(total_solar / total_kwh * 100, 1) if total_kwh else 0
+    total_km_str = f"{total_km:.0f}" if total_km > 0 else ""
     print(f"{'TOTAL':<7} {'':<1} {'':<12} {'':>6} {'':>6} "
-          f"{'':>8} {'':>9} {'':>7} {'':>7} {'':>6} "
+          f"{'':>8} {'':>9} {total_km_str:>7} {'':>7} {'':>6} "
           f"{total_kwh:>6.2f} {total_solar:>7.2f} {total_grid:>7.2f} "
           f"{avg_solar_pct:>6.1f}% ${total_cost:>6.2f} ${total_saving:>8.2f}")
     print("─" * W)
     print("  NA = trip too short to calculate (requires ≥2% SOC drop between sessions)")
+    km_str = f"  |  Total driven: {total_km:.0f} km" if total_km > 0 else ""
     print(f"\n  {len(results)} sessions  |  "
           f"Total charged: {total_kwh:.1f} kWh  |  "
           f"Solar: {total_solar:.1f} kWh ({avg_solar_pct}%)  |  "
           f"Total cost: ${total_cost:.2f}  |  "
-          f"Saved vs all-grid: ${total_saving:.2f}")
+          f"Saved vs all-grid: ${total_saving:.2f}{km_str}")
 
 
 def save_report(results: list[dict], output_path: str) -> None:
@@ -466,8 +472,14 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
     print(f"  {'─'*40}")
     if total_km > 0 and total_kwh > 0:
         overall_eff = total_kwh / total_km * 100
-        print(f"  From logs:                   {overall_eff:.1f} kWh/100km")
-        print(f"  (based on {total_kwh:.1f} kWh charged over {total_km:.0f} km logged)")
+        dates = [s["date_local"] for s in sessions if s.get("date_local")]
+        day_str = ""
+        if dates:
+            span_days = (datetime.strptime(max(dates), "%Y-%m-%d") -
+                         datetime.strptime(min(dates), "%Y-%m-%d")).days + 1
+            day_str = f", {total_km/span_days:.1f} km/day over {span_days} days"
+        print(f"  From logs:                   {overall_eff:.1f} kWh/100km"
+              f"  ({total_kwh:.1f} kWh, {total_km:.0f} km{day_str})")
     else:
         print(f"  Not enough data yet — need km_driven to calculate")
     lifetime_effs = [s["lifetime_efficiency_kwh_per_100km"]
@@ -537,14 +549,16 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
     # ── 6. Seasonal efficiency ──────────────────────────────────────────────
     print(f"\n  6. SEASONAL EFFICIENCY")
     print(f"  {'─'*40}")
-    seasonal = {s: {"kwh": 0.0, "solar_kwh": 0.0, "cost": 0.0, "km": 0.0, "n": 0}
+    seasonal = {s: {"kwh": 0.0, "solar_kwh": 0.0, "cost": 0.0, "km": 0.0, "n": 0,
+                    "min_date": None, "max_date": None}
                 for s in ("Summer", "Autumn", "Winter", "Spring")}
     for r in results:
         try:
             kwh = float(r["total_kwh"])
             if kwh <= 0:
                 continue
-            month = int(r["date"].split("-")[1])
+            d     = r["date"]
+            month = int(d.split("-")[1])
             if month in [12,1,2]:   bucket = "Summer"
             elif month in [3,4,5]:  bucket = "Autumn"
             elif month in [6,7,8]:  bucket = "Winter"
@@ -553,6 +567,10 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
             seasonal[bucket]["solar_kwh"] += float(r["solar_kwh"])
             seasonal[bucket]["cost"]      += float(r["total_cost"])
             seasonal[bucket]["n"]         += 1
+            if seasonal[bucket]["min_date"] is None or d < seasonal[bucket]["min_date"]:
+                seasonal[bucket]["min_date"] = d
+            if seasonal[bucket]["max_date"] is None or d > seasonal[bucket]["max_date"]:
+                seasonal[bucket]["max_date"] = d
             km = float(r["km_driven"]) if r.get("km_driven") else 0
             if km > 0:
                 seasonal[bucket]["km"] += km
@@ -564,10 +582,13 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
             continue
         solar_pct = data["solar_kwh"] / data["kwh"] * 100 if data["kwh"] > 0 else 0
         line = f"  {season:<10} {data['kwh']:.1f} kWh  ({data['n']} sessions, {solar_pct:.0f}% solar)"
-        if data["km"] > 0:
+        if data["km"] > 0 and data["min_date"] and data["max_date"]:
             eff         = data["kwh"] / data["km"] * 100
             cost_per_km = data["cost"] / data["km"]
-            line += f"   {eff:.1f} kWh/100km  ${cost_per_km:.2f}/km  ({data['km']:.0f} km)"
+            span_days   = (datetime.strptime(data["max_date"], "%Y-%m-%d") -
+                           datetime.strptime(data["min_date"], "%Y-%m-%d")).days + 1
+            km_per_day  = data["km"] / span_days
+            line += f"   {eff:.1f} kWh/100km  ${cost_per_km:.2f}/km  ({data['km']:.0f} km, {km_per_day:.1f} km/day)"
         print(line)
 
     # ── 7. Charging behaviour ───────────────────────────────────────────────
