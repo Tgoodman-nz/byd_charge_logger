@@ -28,7 +28,7 @@ from pathlib import Path
 
 # ── Tariff & quote defaults ──────────────────────────────────────────────────
 IMPORT_RATE   = 0.30    # $/kWh
-FEEDIN_RATE   = 0.06    # $/kWh
+FEEDIN_RATE   = 0.015   # $/kWh
 GAS_RATE      = 0.025   # $/MJ
 GAS_SUPPLY    = 0.85    # $/day standing charge
 HEAT_PUMP_COP = 3.5

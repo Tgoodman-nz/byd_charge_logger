@@ -385,7 +385,7 @@ python3 correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKE
 | Argument | Default | Description |
 |---|---|---|
 | `--import-rate` | 0.30 | Grid import rate $/kWh |
-| `--feedin-rate` | 0.06 | Solar feed-in tariff $/kWh |
+| `--feedin-rate` | 0.015 | Solar feed-in tariff $/kWh |
 | `--output` | correlation_report.csv | Output file path |
 | `--sessions` | — | Local BYD sessions CSV (instead of --url) |
 

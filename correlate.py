@@ -52,7 +52,7 @@ import urllib.request
 
 # ── Tariff defaults — override with --import-rate and --feedin-rate ─────────
 DEFAULT_IMPORT_RATE = 0.30   # $/kWh
-DEFAULT_FEEDIN_RATE = 0.06   # $/kWh
+DEFAULT_FEEDIN_RATE = 0.015  # $/kWh
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -537,29 +537,38 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
     # ── 6. Seasonal efficiency ──────────────────────────────────────────────
     print(f"\n  6. SEASONAL EFFICIENCY")
     print(f"  {'─'*40}")
-    seasonal = {s: {"kwh": 0.0, "km": 0.0, "n": 0}
+    seasonal = {s: {"kwh": 0.0, "solar_kwh": 0.0, "cost": 0.0, "km": 0.0, "n": 0}
                 for s in ("Summer", "Autumn", "Winter", "Spring")}
-    for s in sessions:
+    for r in results:
         try:
-            km = float(s["km_driven_since_last_charge"])
-            if km <= 0:
+            kwh = float(r["total_kwh"])
+            if kwh <= 0:
                 continue
-            month = int(s["date_local"].split("-")[1])
+            month = int(r["date"].split("-")[1])
             if month in [12,1,2]:   bucket = "Summer"
             elif month in [3,4,5]:  bucket = "Autumn"
             elif month in [6,7,8]:  bucket = "Winter"
             else:                   bucket = "Spring"
-            seasonal[bucket]["kwh"] += s.get("kwh_estimated", 0)
-            seasonal[bucket]["km"]  += km
-            seasonal[bucket]["n"]   += 1
+            seasonal[bucket]["kwh"]       += kwh
+            seasonal[bucket]["solar_kwh"] += float(r["solar_kwh"])
+            seasonal[bucket]["cost"]      += float(r["total_cost"])
+            seasonal[bucket]["n"]         += 1
+            km = float(r["km_driven"]) if r.get("km_driven") else 0
+            if km > 0:
+                seasonal[bucket]["km"] += km
         except Exception:
             pass
     for season, data in seasonal.items():
-        if data["km"] > 0:
-            eff = data["kwh"] / data["km"] * 100
-            print(f"  {season:<10} {eff:.1f} kWh/100km  ({data['n']} sessions, {data['km']:.0f} km)")
-        else:
+        if data["n"] == 0:
             print(f"  {season:<10} no data yet")
+            continue
+        solar_pct = data["solar_kwh"] / data["kwh"] * 100 if data["kwh"] > 0 else 0
+        line = f"  {season:<10} {data['kwh']:.1f} kWh  ({data['n']} sessions, {solar_pct:.0f}% solar)"
+        if data["km"] > 0:
+            eff         = data["kwh"] / data["km"] * 100
+            cost_per_km = data["cost"] / data["km"]
+            line += f"   {eff:.1f} kWh/100km  ${cost_per_km:.2f}/km  ({data['km']:.0f} km)"
+        print(line)
 
     # ── 7. Charging behaviour ───────────────────────────────────────────────
     print(f"\n  7. CHARGING BEHAVIOUR")
