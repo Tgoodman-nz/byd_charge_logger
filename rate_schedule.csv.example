@@ -1,0 +1,6 @@
+provider,from_date,to_date,import_rate,feedin_rate,offpeak_rate,offpeak_start,offpeak_end
+# from_date / to_date: YYYY-MM-DD, or leave blank for open-ended
+# offpeak_rate: leave blank to disable TOU split for that period
+# offpeak_start / offpeak_end: hour 0-23 (default 0 and 6 = midnight to 6am)
+Example Retailer A,,2026-05-13,0.30,0.054,,,
+Example Retailer B (TOU),2026-05-14,,0.29381,0.01,0.045,0,6

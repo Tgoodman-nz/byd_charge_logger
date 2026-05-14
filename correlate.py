@@ -55,6 +55,41 @@ DEFAULT_IMPORT_RATE = 0.30   # $/kWh
 DEFAULT_FEEDIN_RATE = 0.015  # $/kWh
 # ────────────────────────────────────────────────────────────────────────────
 
+DEFAULT_RATE_SCHEDULE_PATH = Path(__file__).parent / "rate_schedule.csv"
+
+
+def load_rate_schedule(path: Path) -> list[dict]:
+    """Load retailer rate schedule from a CSV file.
+
+    Columns: provider, from_date, to_date, import_rate, feedin_rate,
+             offpeak_rate, offpeak_start, offpeak_end
+    Blank from_date / to_date = open-ended. Blank offpeak_rate = flat tariff (no TOU split).
+    Lines starting with # are ignored.
+    """
+    if not path.exists():
+        return []
+    schedule = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(r for r in f if not r.lstrip().startswith("#")):
+            try:
+                entry: dict = {
+                    "provider":      row.get("provider", "").strip(),
+                    "from_date":     row.get("from_date", "").strip() or None,
+                    "to_date":       row.get("to_date", "").strip()   or None,
+                    "import_rate":   float(row["import_rate"]),
+                    "feedin_rate":   float(row["feedin_rate"]),
+                    "offpeak_rate":  float(row["offpeak_rate"]) if row.get("offpeak_rate", "").strip() else None,
+                }
+                if entry["offpeak_rate"] is not None:
+                    entry["offpeak_start"] = int(row.get("offpeak_start") or 0)
+                    entry["offpeak_end"]   = int(row.get("offpeak_end")   or 6)
+                schedule.append(entry)
+            except (KeyError, ValueError) as e:
+                print(f"  Warning: skipping rate_schedule row — {e}")
+    if schedule:
+        print(f"  Loaded {len(schedule)} rate schedule entries from {path.name}")
+    return schedule
+
 
 def fetch_url(url: str) -> str:
     ctx = None
@@ -219,14 +254,51 @@ def load_sessions(source: str) -> list[dict]:
     return sessions
 
 
+def _rates_for_date(date_str: str, schedule: list, defaults: dict) -> dict:
+    """Return rates for a session date, using the schedule or falling back to defaults."""
+    for entry in schedule:
+        from_d = entry.get("from_date")
+        to_d   = entry.get("to_date")
+        if (from_d is None or date_str >= from_d) and (to_d is None or date_str <= to_d):
+            return {
+                "provider":      entry.get("provider", ""),
+                "import_rate":   entry.get("import_rate",   defaults["import_rate"]),
+                "feedin_rate":   entry.get("feedin_rate",   defaults["feedin_rate"]),
+                "offpeak_rate":  entry.get("offpeak_rate",  defaults.get("offpeak_rate")),
+                "offpeak_start": entry.get("offpeak_start", defaults.get("offpeak_start", 0)),
+                "offpeak_end":   entry.get("offpeak_end",   defaults.get("offpeak_end",   6)),
+            }
+    return {"provider": "", **defaults}
+
+
+def _offpeak_minutes(start: datetime, end: datetime, op_start: int, op_end: int) -> float:
+    """Count minutes of [start, end) falling in the off-peak window."""
+    from datetime import timedelta
+    count = 0
+    cur = start.replace(second=0, microsecond=0)
+    end_min = end.replace(second=0, microsecond=0)
+    while cur < end_min:
+        h = cur.hour
+        in_op = (op_start <= h < op_end) if op_start < op_end else (h >= op_start or h < op_end)
+        if in_op:
+            count += 1
+        cur += timedelta(minutes=1)
+    return float(count)
+
+
 def correlate(sessions: list[dict], powerpal: list[dict],
               import_rate: float, feedin_rate: float,
-              cache: dict | None = None) -> tuple[list[dict], dict]:
+              cache: dict | None = None,
+              offpeak_rate: float | None = None,
+              offpeak_start: int = 0, offpeak_end: int = 6,
+              rate_schedule: list | None = None) -> tuple[list[dict], dict]:
     """Correlate sessions with PowerPal data, using the cache for already-processed sessions.
 
     Returns (results, updated_cache). Costs are always recalculated from current rates so
     changing --import-rate / --feedin-rate never requires --recalculate.
     Sessions with 0% PowerPal coverage are not cached (data gap — will retry next run).
+    If rate_schedule is provided, per-session rates are looked up from it; otherwise the
+    flat import_rate/feedin_rate/offpeak_rate args are used for all sessions.
     """
     if cache is None:
         cache = {}
@@ -297,11 +369,33 @@ def correlate(sessions: list[dict], powerpal: list[dict],
                     "powerpal_note":     note,
                 }
 
+        # Per-session rates — from schedule if provided, else flat args
+        rates = _rates_for_date(s["date"], rate_schedule or [], {
+            "import_rate": import_rate, "feedin_rate": feedin_rate,
+            "offpeak_rate": offpeak_rate, "offpeak_start": offpeak_start,
+            "offpeak_end": offpeak_end,
+        })
+        r_import   = rates["import_rate"]
+        r_feedin   = rates["feedin_rate"]
+        r_offpeak  = rates["offpeak_rate"]
+        r_op_start = rates["offpeak_start"]
+        r_op_end   = rates["offpeak_end"]
+        provider   = rates["provider"]
+
         # Costs always recalculated from current rates
-        solar_cost    = round(solar_kwh * feedin_rate, 2)
-        grid_cost     = round(grid_kwh  * import_rate, 2)
+        if r_offpeak is not None and total_kwh > 0:
+            total_min      = max((s["end"] - s["start"]).total_seconds() / 60, 1)
+            op_min         = _offpeak_minutes(s["start"], s["end"], r_op_start, r_op_end)
+            op_frac        = op_min / total_min
+            effective_rate = op_frac * r_offpeak + (1 - op_frac) * r_import
+            offpeak_kwh    = round(grid_kwh * op_frac, 3)
+        else:
+            effective_rate = r_import
+            offpeak_kwh    = 0.0
+        solar_cost    = round(solar_kwh * r_feedin, 2)
+        grid_cost     = round(grid_kwh  * effective_rate, 2)
         total_cost    = round(solar_cost + grid_cost, 2)
-        all_grid_cost = round(total_kwh  * import_rate, 2)
+        all_grid_cost = round(total_kwh  * effective_rate, 2)
         saving        = round(all_grid_cost - total_cost, 2)
 
         # Estimated range and efficiency: km driven divided by % used on that leg
@@ -327,6 +421,7 @@ def correlate(sessions: list[dict], powerpal: list[dict],
 
         results.append({
             "session_id":         s["session_id"],
+            "provider":           provider,
             "location":           location,
             "date":               s["date"],
             "start_local":        s["start"].strftime("%H:%M"),
@@ -346,6 +441,8 @@ def correlate(sessions: list[dict], powerpal: list[dict],
             "grid_cost":          grid_cost,
             "total_cost":         total_cost,
             "saving_vs_grid":     saving,
+            "peak_kwh":           round(grid_kwh - offpeak_kwh, 3),
+            "offpeak_kwh":        offpeak_kwh,
             "powerpal_coverage":  coverage,
             "note":               note,
         })
@@ -353,20 +450,11 @@ def correlate(sessions: list[dict], powerpal: list[dict],
     return results, cache
 
 
-def print_summary(results: list[dict]) -> None:
-    if not results:
-        print("\nNo sessions to display.")
-        return
-
-    W = 151
-    print("\n" + "─" * W)
-    print(f"{'ID':<7} {'L':>1} {'Date':<12} {'Start':>6} {'End':>6} {'Odo km':>8} {'SOC%':>9} {'km drv':>7} {'~Range':>7} {'km/%':>6} {'kWh':>6} "
-          f"{'Solar':>7} {'Grid':>7} {'Solar%':>7} {'Cost $':>7} {'Saving $':>9} {'Coverage':>9}")
-    print("─" * W)
-
-    total_kwh = total_solar = total_grid = total_cost = total_saving = total_km = 0.0
-
-    for r in results:
+def _print_summary_rows(rows: list[dict]) -> tuple[float, float, float, float, float, float, float, float]:
+    """Print session rows and return (kwh, solar, grid, peak, op, cost, saving, km) totals."""
+    total_kwh = total_solar = total_grid = total_peak = total_op = 0.0
+    total_cost = total_saving = total_km = 0.0
+    for r in rows:
         try:
             odo_str = f"{float(r['odo_end_km']):.0f}" if r.get("odo_end_km") else "—"
         except (ValueError, TypeError):
@@ -382,38 +470,104 @@ def print_summary(results: list[dict]) -> None:
             km_val = None
             km_str = "—"
         est_range = r.get("est_range_km")
-        rng_str = "NA" if est_range == "NA" else (f"{est_range} km" if est_range else "—")
+        rng_str   = "NA" if est_range == "NA" else (f"{est_range} km" if est_range else "—")
         kmpct_str = f"{r['km_per_pct']}" if r.get("km_per_pct") else "—"
-        loc_str = r.get("location", "H") or "H"
+        loc_str   = r.get("location", "H") or "H"
+        op_kwh    = r.get("offpeak_kwh", 0.0) or 0.0
+        peak_kwh  = r.get("peak_kwh",    0.0) or 0.0
         print(f"{r['session_id']:<7} {loc_str:>1} {r['date']:<12} {r['start_local']:>6} {r['end_local']:>6} "
               f"{odo_str:>8} {soc_str:>9} {km_str:>7} {rng_str:>7} {kmpct_str:>6} "
               f"{r['total_kwh']:>6.2f} {r['solar_kwh']:>7.2f} {r['grid_kwh']:>7.2f} "
+              f"{peak_kwh:>7.2f} {op_kwh:>7.2f} "
               f"{r['solar_pct']:>6.1f}% ${r['total_cost']:>6.2f} ${r['saving_vs_grid']:>8.2f}"
               f"  {r['powerpal_coverage']:>6}"
               + (f"  {r['note']}" if r["note"] else ""))
         total_kwh    += r["total_kwh"]
         total_solar  += r["solar_kwh"]
         total_grid   += r["grid_kwh"]
+        total_peak   += peak_kwh
+        total_op     += op_kwh
         total_cost   += r["total_cost"]
         total_saving += r["saving_vs_grid"]
         if km_val is not None:
             total_km += km_val
+    return total_kwh, total_solar, total_grid, total_peak, total_op, total_cost, total_saving, total_km
 
-    print("─" * W)
-    avg_solar_pct = round(total_solar / total_kwh * 100, 1) if total_kwh else 0
-    total_km_str = f"{total_km:.0f}" if total_km > 0 else ""
+
+def print_summary(results: list[dict]) -> None:
+    if not results:
+        print("\nNo sessions to display.")
+        return
+
+    W = 167
+    HDR = (f"{'ID':<7} {'L':>1} {'Date':<12} {'Start':>6} {'End':>6} {'Odo km':>8} {'SOC%':>9} {'km drv':>7} "
+           f"{'~Range':>7} {'km/%':>6} {'kWh':>6} {'Solar':>7} {'Grid':>7} {'Peak':>7} {'OP':>7} {'Solar%':>7} "
+           f"{'Cost $':>7} {'Saving $':>9} {'Coverage':>9}")
+
+    # Group by provider (preserving order of first appearance)
+    providers_seen: list[str] = []
+    by_provider: dict[str, list[dict]] = {}
+    for r in results:
+        p = r.get("provider") or ""
+        if p not in by_provider:
+            providers_seen.append(p)
+            by_provider[p] = []
+        by_provider[p].append(r)
+
+    grand_kwh = grand_solar = grand_grid = grand_peak = grand_op = 0.0
+    grand_cost = grand_saving = grand_km = 0.0
+    multi_provider = len(providers_seen) > 1
+
+    print("\n" + "─" * W)
+    for p in providers_seen:
+        rows = by_provider[p]
+        if multi_provider:
+            label = p if p else "Unknown"
+            print(f"  ── {label} ({'from ' + rows[0]['date'] + ' ' if rows else ''}{'to ' + rows[-1]['date'] if rows else ''}) ──")
+        print(HDR)
+        print("─" * W)
+
+        kwh, solar, grid, peak, op, cost, saving, km = _print_summary_rows(rows)
+        grand_kwh    += kwh
+        grand_solar  += solar
+        grand_grid   += grid
+        grand_peak   += peak
+        grand_op     += op
+        grand_cost   += cost
+        grand_saving += saving
+        grand_km     += km
+
+        if multi_provider:
+            avg_sp = round(solar / kwh * 100, 1) if kwh else 0
+            km_col = f"{km:.0f}" if km > 0 else ""
+            print("─" * W)
+            print(f"{'  Sub':<7} {'':<1} {'':<12} {'':>6} {'':>6} "
+                  f"{'':>8} {'':>9} {km_col:>7} {'':>7} {'':>6} "
+                  f"{kwh:>6.2f} {solar:>7.2f} {grid:>7.2f} "
+                  f"{peak:>7.2f} {op:>7.2f} "
+                  f"{avg_sp:>6.1f}% ${cost:>6.2f} ${saving:>8.2f}")
+            print("─" * W)
+            print()
+
+    if not multi_provider:
+        print("─" * W)
+
+    avg_solar_pct = round(grand_solar / grand_kwh * 100, 1) if grand_kwh else 0
+    total_km_str  = f"{grand_km:.0f}" if grand_km > 0 else ""
     print(f"{'TOTAL':<7} {'':<1} {'':<12} {'':>6} {'':>6} "
           f"{'':>8} {'':>9} {total_km_str:>7} {'':>7} {'':>6} "
-          f"{total_kwh:>6.2f} {total_solar:>7.2f} {total_grid:>7.2f} "
-          f"{avg_solar_pct:>6.1f}% ${total_cost:>6.2f} ${total_saving:>8.2f}")
+          f"{grand_kwh:>6.2f} {grand_solar:>7.2f} {grand_grid:>7.2f} "
+          f"{grand_peak:>7.2f} {grand_op:>7.2f} "
+          f"{avg_solar_pct:>6.1f}% ${grand_cost:>6.2f} ${grand_saving:>8.2f}")
     print("─" * W)
     print("  NA = trip too short to calculate (requires ≥2% SOC drop between sessions)")
-    km_str = f"  |  Total driven: {total_km:.0f} km" if total_km > 0 else ""
+    print("  Peak / OP = grid kWh at peak and off-peak rates respectively")
+    km_str = f"  |  Total driven: {grand_km:.0f} km" if grand_km > 0 else ""
     print(f"\n  {len(results)} sessions  |  "
-          f"Total charged: {total_kwh:.1f} kWh  |  "
-          f"Solar: {total_solar:.1f} kWh ({avg_solar_pct}%)  |  "
-          f"Total cost: ${total_cost:.2f}  |  "
-          f"Saved vs all-grid: ${total_saving:.2f}{km_str}")
+          f"Total charged: {grand_kwh:.1f} kWh  |  "
+          f"Solar: {grand_solar:.1f} kWh ({avg_solar_pct}%)  |  "
+          f"Total cost: ${grand_cost:.2f}  |  "
+          f"Saved vs all-grid: ${grand_saving:.2f}{km_str}")
 
 
 def save_report(results: list[dict], output_path: str) -> None:
@@ -660,7 +814,7 @@ from aemo import spot_prices_for_window  # noqa: E402
 AMBER_CACHE_HDRS = [
     "session_id", "avg_spot_c_kwh", "min_spot_c_kwh", "max_spot_c_kwh",
     "negative_price_minutes", "amber_energy_cost", "amber_network_cost",
-    "amber_total_cost", "fixed_total_cost", "amber_saving",
+    "amber_total_cost",
 ]
 
 
@@ -675,8 +829,13 @@ def _load_amber_cache(path: Path) -> dict:
 
 
 def calculate_amber_costs(sessions: list[dict], region: str, network_rate: float,
-                           import_rate: float, utc_offset: int,
+                           utc_offset: int,
                            cache_path: Path, cache_dir: Path) -> dict:
+    """Fetch and cache AEMO spot price data per session.
+
+    Only AEMO price data is cached — plan cost comparisons are recalculated each
+    run from the current rate schedule so changing rates never requires --recalculate.
+    """
     from datetime import timedelta
     NEM_DELTA = timedelta(hours=10 - utc_offset)  # convert local time → NEM time (UTC+10)
     cache     = _load_amber_cache(cache_path)
@@ -705,8 +864,6 @@ def calculate_amber_costs(sessions: list[dict], region: str, network_rate: float
         energy_cost  = round(kwh * avg_rrp / 1000, 2)
         network_cost = round(kwh * network_rate, 2)
         amber_total  = round(energy_cost + network_cost, 2)
-        fixed_total  = round(kwh * import_rate, 2)
-        saving       = round(fixed_total - amber_total, 2)
 
         row = {
             "session_id":             s["session_id"],
@@ -717,74 +874,108 @@ def calculate_amber_costs(sessions: list[dict], region: str, network_rate: float
             "amber_energy_cost":      energy_cost,
             "amber_network_cost":     network_cost,
             "amber_total_cost":       amber_total,
-            "fixed_total_cost":       fixed_total,
-            "amber_saving":           saving,
         }
         cache[s["session_id"]] = row
         new_rows.append(row)
 
     if new_rows:
-        write_header = not cache_path.exists()
-        with open(cache_path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=AMBER_CACHE_HDRS)
-            if write_header:
-                w.writeheader()
-            w.writerows(new_rows)
+        # Rewrite full cache to normalise schema (drops stale columns like fixed_total_cost)
+        with open(cache_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=AMBER_CACHE_HDRS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(cache.values())
         print(f"  Amber cache updated ({len(new_rows)} new row(s)): {cache_path}")
 
     return cache
 
 
 def print_amber_summary(amber: dict, sessions: list[dict],
-                         region: str, network_rate: float, subscription: float) -> None:
+                         region: str, network_rate: float, subscription: float,
+                         rate_schedule: list | None = None,
+                         import_rate: float = DEFAULT_IMPORT_RATE,
+                         feedin_rate: float = DEFAULT_FEEDIN_RATE,
+                         offpeak_rate: float | None = None,
+                         offpeak_start: int = 0, offpeak_end: int = 6) -> None:
+    """Print Amber wholesale comparison. Plan cost is recalculated per session from
+    the rate schedule (including TOU blending) so it always reflects current rates."""
     rows = [s for s in sessions if s["session_id"] in amber]
     if not rows:
         return
 
-    W = 95
+    W = 111
     print(f"\n{'─' * W}")
     print(f"  AMBER WHOLESALE ESTIMATE  —  region: {region}  "
           f"network: {network_rate * 100:.1f}c/kWh  "
           f"subscription: ${subscription:.0f}/mo")
     print(f"  AEMO 5-min dispatch prices. Amber bills 30-min trading price — estimate only.")
     print(f"{'─' * W}")
-    print(f"{'ID':<7} {'Date':<12} {'kWh':>5} {'Avg c/kWh':>10} {'Min':>7} {'Max':>7} "
-          f"{'Neg min':>7} {'Fixed $':>8} {'Amber $':>8} {'Saving $':>9}")
+    print(f"{'ID':<7} {'Date':<12} {'kWh':>5} {'Peak':>6} {'OP':>6} {'Avg c/kWh':>10} {'Min':>7} {'Max':>7} "
+          f"{'Neg min':>7} {'Plan $':>8} {'Amber $':>8} {'Saving $':>9}")
     print(f"{'─' * W}")
 
-    tot_kwh = tot_fixed = tot_amber = tot_saving = 0.0
+    tot_kwh = tot_peak = tot_op = tot_plan = tot_amber = tot_saving = 0.0
     tot_neg = 0
+    has_tou = False
 
     for s in rows:
-        a       = amber[s["session_id"]]
-        kwh     = s["kwh_estimated"]
-        avg_c   = float(a["avg_spot_c_kwh"])
-        min_c   = float(a["min_spot_c_kwh"])
-        max_c   = float(a["max_spot_c_kwh"])
-        neg_m   = int(a["negative_price_minutes"])
-        fixed   = float(a["fixed_total_cost"])
-        cost    = float(a["amber_total_cost"])
-        saving  = float(a["amber_saving"])
+        a     = amber[s["session_id"]]
+        kwh   = s["kwh_estimated"]
+        avg_c = float(a["avg_spot_c_kwh"])
+        min_c = float(a["min_spot_c_kwh"])
+        max_c = float(a["max_spot_c_kwh"])
+        neg_m = int(a["negative_price_minutes"])
+        cost  = float(a["amber_total_cost"])
+
+        # Per-session plan cost from rate schedule (including TOU blending)
+        rates = _rates_for_date(s["date"], rate_schedule or [], {
+            "import_rate":   import_rate,   "feedin_rate":   feedin_rate,
+            "offpeak_rate":  offpeak_rate,  "offpeak_start": offpeak_start,
+            "offpeak_end":   offpeak_end,
+        })
+        r_import   = rates["import_rate"]
+        r_offpeak  = rates["offpeak_rate"]
+        r_op_start = rates["offpeak_start"]
+        r_op_end   = rates["offpeak_end"]
+
+        if r_offpeak is not None and kwh > 0:
+            total_min      = max((s["end"] - s["start"]).total_seconds() / 60, 1)
+            op_min         = _offpeak_minutes(s["start"], s["end"], r_op_start, r_op_end)
+            op_frac        = op_min / total_min
+            effective_rate = op_frac * r_offpeak + (1 - op_frac) * r_import
+            op_kwh         = round(kwh * op_frac, 2)
+            peak_kwh       = round(kwh - op_kwh, 2)
+            has_tou        = True
+        else:
+            effective_rate = r_import
+            op_kwh         = 0.0
+            peak_kwh       = round(kwh, 2)
+        plan_cost = round(kwh * effective_rate, 2)
+        saving    = round(plan_cost - cost, 2)
+
         neg_str = f"{neg_m}m" if neg_m > 0 else "—"
         flag    = " ★" if neg_m > 0 else ""
-        print(f"{s['session_id']:<7} {s['date']:<12} {kwh:>5.2f} {avg_c:>9.1f}c "
+        print(f"{s['session_id']:<7} {s['date']:<12} {kwh:>5.2f} {peak_kwh:>6.2f} {op_kwh:>6.2f} {avg_c:>9.1f}c "
               f"{min_c:>6.1f}c {max_c:>6.1f}c {neg_str:>7} "
-              f"${fixed:>7.2f} ${cost:>7.2f} ${saving:>8.2f}{flag}")
+              f"${plan_cost:>7.2f} ${cost:>7.2f} ${saving:>8.2f}{flag}")
         tot_kwh   += kwh
-        tot_fixed += fixed
+        tot_peak  += peak_kwh
+        tot_op    += op_kwh
+        tot_plan  += plan_cost
         tot_amber += cost
         tot_saving += saving
         tot_neg   += neg_m
 
     print(f"{'─' * W}")
-    print(f"{'TOTAL':<7} {'':<12} {tot_kwh:>5.2f} {'':>10} {'':>7} {'':>7} "
-          f"{tot_neg:>5}m {'':>2} ${tot_fixed:>7.2f} ${tot_amber:>7.2f} ${tot_saving:>8.2f}")
+    print(f"{'TOTAL':<7} {'':<12} {tot_kwh:>5.2f} {tot_peak:>6.2f} {tot_op:>6.2f} {'':>10} {'':>7} {'':>7} "
+          f"{tot_neg:>5}m {'':>2} ${tot_plan:>7.2f} ${tot_amber:>7.2f} ${tot_saving:>8.2f}")
     print(f"{'─' * W}")
 
     print(f"\n  ★ = session had negative-price period (Amber credits you during these minutes)")
+    if has_tou:
+        print(f"  Peak / OP = kWh split by session timing; Plan $ uses blended TOU rate")
     print(f"  Amber ${subscription:.0f}/mo service charge excluded — covers the whole house, not just the car.")
     verdict = f"CHEAPER by ${tot_saving:.2f}" if tot_saving > 0 else f"MORE EXPENSIVE by ${abs(tot_saving):.2f}"
-    print(f"  Vs fixed rate (excl. service charge): Amber would have been {verdict}")
+    print(f"  Vs current plan (excl. service charge): Amber would have been {verdict}")
 
 
 def main() -> None:
@@ -796,9 +987,15 @@ def main() -> None:
     parser.add_argument("--sessions",        help="Local path to BYD sessions CSV (alternative to --url)")
     parser.add_argument("--output",          default="correlation_report.csv", help="Output CSV path")
     parser.add_argument("--import-rate",     type=float, default=DEFAULT_IMPORT_RATE,
-                        help=f"Grid import rate $/kWh (default {DEFAULT_IMPORT_RATE})")
+                        help=f"Grid peak import rate $/kWh (default {DEFAULT_IMPORT_RATE})")
     parser.add_argument("--feedin-rate",     type=float, default=DEFAULT_FEEDIN_RATE,
                         help=f"Solar feed-in tariff $/kWh (default {DEFAULT_FEEDIN_RATE})")
+    parser.add_argument("--offpeak-rate",    type=float, default=None, metavar="RATE",
+                        help="Off-peak rate $/kWh — enables TOU cost calculation (e.g. 0.045 for OVO)")
+    parser.add_argument("--offpeak-start",   type=int,   default=0,    metavar="HOUR",
+                        help="Off-peak window start hour 0-23 (default 0 = midnight)")
+    parser.add_argument("--offpeak-end",     type=int,   default=6,    metavar="HOUR",
+                        help="Off-peak window end hour 0-23 (default 6 = 6am)")
     # Amber / AEMO wholesale comparison
     parser.add_argument("--region",          choices=["QLD", "NSW", "VIC", "SA", "TAS"],
                         help="NEM region — enables Amber wholesale cost estimate")
@@ -816,6 +1013,8 @@ def main() -> None:
                         help="Persistent PowerPal correlation cache (default correlation_cache.csv)")
     parser.add_argument("--recalculate",     action="store_true",
                         help="Ignore cache and re-fetch PowerPal for all sessions")
+    parser.add_argument("--rate-schedule",   default=str(DEFAULT_RATE_SCHEDULE_PATH), metavar="FILE",
+                        help="CSV of retailer rate periods (default rate_schedule.csv)")
     args = parser.parse_args()
 
     if not args.url and not args.sessions:
@@ -826,6 +1025,7 @@ def main() -> None:
     print("══════════════════════════")
 
     print("\nLoading data …")
+    rate_schedule = load_rate_schedule(Path(args.rate_schedule))
     sessions = load_sessions(args.url or args.sessions)
 
     if not sessions:
@@ -847,20 +1047,26 @@ def main() -> None:
     if args.powerpal:
         powerpal = load_powerpal(args.powerpal)
         print(f"\nCorrelating (import={args.import_rate} $/kWh, feedin={args.feedin_rate} $/kWh) …")
-        results, cache = correlate(sessions, powerpal, args.import_rate, args.feedin_rate, cache)
+        results, cache = correlate(sessions, powerpal, args.import_rate, args.feedin_rate, cache,
+                                       args.offpeak_rate, args.offpeak_start, args.offpeak_end,
+                                       rate_schedule=rate_schedule)
         save_correlation_cache(cache, cache_path)
         print_summary(results)
         save_report(results, args.output)
     elif serial and api_key:
         powerpal = fetch_powerpal(serial, api_key, sessions, cache)
         print(f"\nCorrelating (import={args.import_rate} $/kWh, feedin={args.feedin_rate} $/kWh) …")
-        results, cache = correlate(sessions, powerpal, args.import_rate, args.feedin_rate, cache)
+        results, cache = correlate(sessions, powerpal, args.import_rate, args.feedin_rate, cache,
+                                       args.offpeak_rate, args.offpeak_start, args.offpeak_end,
+                                       rate_schedule=rate_schedule)
         save_correlation_cache(cache, cache_path)
         print_summary(results)
         save_report(results, args.output)
     elif cache:
         print(f"\nCorrelating from cache (import={args.import_rate} $/kWh, feedin={args.feedin_rate} $/kWh) …")
-        results, _ = correlate(sessions, [], args.import_rate, args.feedin_rate, cache)
+        results, _ = correlate(sessions, [], args.import_rate, args.feedin_rate, cache,
+                               args.offpeak_rate, args.offpeak_start, args.offpeak_end,
+                               rate_schedule=rate_schedule)
         print_summary(results)
         save_report(results, args.output)
     else:
@@ -874,11 +1080,17 @@ def main() -> None:
     if args.region:
         amber = calculate_amber_costs(
             sessions, args.region, args.amber_network_rate,
-            args.import_rate, args.utc_offset,
+            args.utc_offset,
             Path(args.amber_cache), Path(args.aemo_cache_dir),
         )
         print_amber_summary(amber, sessions, args.region,
-                            args.amber_network_rate, args.amber_subscription)
+                            args.amber_network_rate, args.amber_subscription,
+                            rate_schedule=rate_schedule,
+                            import_rate=args.import_rate,
+                            feedin_rate=args.feedin_rate,
+                            offpeak_rate=args.offpeak_rate,
+                            offpeak_start=args.offpeak_start,
+                            offpeak_end=args.offpeak_end)
 
 
 if __name__ == "__main__":

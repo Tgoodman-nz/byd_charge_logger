@@ -372,6 +372,34 @@ py correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN"
 python3 correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN"
 ```
 
+### Retailer rate schedule
+
+Create `rate_schedule.csv` in the same folder as `correlate.py` to configure your electricity rates. This file is never committed to git — it stays private on your machine.
+
+```csv
+provider,from_date,to_date,import_rate,feedin_rate,offpeak_rate,offpeak_start,offpeak_end
+Retailer A,,2026-05-13,0.30,0.054,,,
+Retailer B (TOU),2026-05-14,,0.29381,0.01,0.045,0,6
+```
+
+| Column | Notes |
+|---|---|
+| `from_date` / `to_date` | `YYYY-MM-DD`, or blank for open-ended |
+| `import_rate` | Peak import rate $/kWh |
+| `feedin_rate` | Solar feed-in tariff $/kWh |
+| `offpeak_rate` | Off-peak rate $/kWh — leave blank to disable TOU split for that period |
+| `offpeak_start` / `offpeak_end` | Off-peak window hours 0–23 (default `0` and `6` = midnight to 6am) |
+
+When you switch retailer, add a new row with the changeover date. The report automatically splits into per-provider sections with subtotals and a grand total, and applies the correct rates to each session.
+
+A template is provided in `rate_schedule.csv.example`.
+
+### Output — session table
+
+Prints a summary table showing per-session: odometer, SOC% start→end, km driven, kWh charged, solar vs grid split, **Peak kWh and OP (off-peak) kWh**, cost, and savings. When a rate schedule is loaded with multiple providers, the table is grouped into per-provider sections with subtotals.
+
+Also saves `correlation_report.csv` and an EV Insights summary covering efficiency, battery health, seasonal variation, cost per km, and savings vs petrol.
+
 ### PowerPal data — three options
 
 | Option | When to use | Command |
@@ -384,24 +412,23 @@ python3 correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKE
 
 | Argument | Default | Description |
 |---|---|---|
-| `--import-rate` | 0.30 | Grid import rate $/kWh |
-| `--feedin-rate` | 0.015 | Solar feed-in tariff $/kWh |
-| `--output` | correlation_report.csv | Output file path |
+| `--import-rate` | 0.30 | Fallback peak import rate $/kWh (used if no rate schedule) |
+| `--feedin-rate` | 0.015 | Fallback solar feed-in tariff $/kWh |
+| `--offpeak-rate` | *(off)* | Fallback off-peak rate $/kWh — enables TOU split if no rate schedule |
+| `--offpeak-start` | 0 | Fallback off-peak window start hour (midnight) |
+| `--offpeak-end` | 6 | Fallback off-peak window end hour (6am) |
+| `--rate-schedule` | `rate_schedule.csv` | Path to retailer rate schedule CSV |
+| `--output` | correlation_report.csv | Output CSV path |
 | `--sessions` | — | Local BYD sessions CSV (instead of --url) |
-
-### Output
-
-Prints a summary table to the terminal showing per-session: odometer, SOC% start→end, km driven, kWh charged, solar vs grid split, cost, and savings. Also saves `correlation_report.csv` and an EV Insights summary covering efficiency, battery health, seasonal variation, cost per km, and savings vs petrol.
 
 ### Would wholesale electricity cost less?
 
-Add `--region` to enable the Amber wholesale estimate. For each session, it fetches the actual AEMO spot price from NEMWeb and calculates what you would have paid on a pass-through plan like Amber, compared to your fixed tariff.
+Add `--region` to enable the Amber wholesale estimate. For each session, it fetches the actual AEMO spot price from NEMWeb and calculates what you would have paid on a pass-through plan like Amber, compared to your **current plan** (using the rate schedule, including TOU blending where applicable).
 
 **Windows:**
 ```powershell
 py correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN" `
   --region VIC `
-  --import-rate 0.437 `
   --amber-network-rate 0.09
 ```
 
@@ -409,21 +436,21 @@ py correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN" `
 ```bash
 python3 correlate.py --url "https://YOUR_VM_IP:8080/sessions.csv?token=YOUR_TOKEN" \
   --region VIC \
-  --import-rate 0.437 \
   --amber-network-rate 0.09
 ```
 
-Replace `VIC` with your NEM region (`QLD`, `NSW`, `VIC`, `SA`, or `TAS`). Set `--import-rate` to your actual fixed tariff from your electricity bill. Set `--amber-network-rate` to the network/distribution component shown on your bill (typically 9–12c/kWh).
+Replace `VIC` with your NEM region (`QLD`, `NSW`, `VIC`, `SA`, or `TAS`). Set `--amber-network-rate` to the network/distribution component shown on your bill (typically 9–12c/kWh).
+
+The Amber table shows **Peak kWh and OP kWh** per session (split by session timing), the "Plan $" column uses the blended rate from your rate schedule, and the saving column shows how much Amber would have saved or cost vs your actual plan.
 
 | Argument | Default | Description |
 |---|---|---|
 | `--region` | *(off)* | NEM region — required to enable wholesale comparison |
-| `--import-rate` | 0.30 | Your current fixed rate $/kWh |
 | `--amber-network-rate` | 0.09 | Network charge $/kWh (check your bill) |
 | `--amber-subscription` | 18.00 | Amber monthly fee $ — shown in output for reference only |
 | `--utc-offset` | 10 | UTC offset: 10 = AEST, 11 = AEDT |
 
-Results are cached in `amber_cache.csv` — already-priced sessions are never re-fetched, so subsequent runs are instant for existing sessions. AEMO price data is cached in `aemo_cache/`. For a full explanation of how the data is sourced and what the output means, see [AEMO_WHOLESALE.md](docs/AEMO_WHOLESALE.md).
+AEMO spot prices are cached per-session in `amber_cache.csv` — only the raw price data is stored, so changing your rate schedule is always reflected on the next run without needing `--recalculate`. AEMO price files are cached in `aemo_cache/`. For a full explanation of how the data is sourced and what the output means, see [AEMO_WHOLESALE.md](docs/AEMO_WHOLESALE.md).
 
 ### Setting up PowerPal API access
 
