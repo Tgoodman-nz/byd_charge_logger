@@ -14,7 +14,7 @@ If you have a BYD EV and a home solar system, this tool helps you answer:
 8. **How much have I saved vs petrol?** — compare electricity cost to equivalent petrol cost per km
 9. **What is my real-world range?** — average km driven per charge cycle in your actual driving patterns
 10. **Should I invest in solar, a battery, or electrify gas appliances?** — payback analysis using your actual data
-11. **Would a wholesale electricity plan cost less?** — compare your fixed rate against AEMO spot prices session-by-session to see if switching to a pass-through retailer like Amber would save money on EV charging
+11. **Would a different electricity plan cost less?** — three-way comparison of your fixed rate vs a TOU plan (e.g. OVO with 4.5c/kWh midnight–6am EV rate) vs wholesale spot (e.g. Amber), using your actual NEM12 interval data and real quarterly bills
 
 ---
 
@@ -453,18 +453,29 @@ See [run.bat.example](run.bat.example) for a ready-to-use Windows shortcut.
 
 ## Electricity Retailer Comparison — nem12_wholesale.py
 
-> **Not BYD-specific** — this tool compares your overall household electricity costs across your fixed-rate retailer vs a wholesale spot-price plan (e.g. Amber Electric). It uses your full NEM12 interval meter data, not just EV charging sessions.
+> **Not BYD-specific** — this tool compares your overall household electricity costs across your fixed-rate retailer, a time-of-use (TOU) plan, and a wholesale spot-price plan (e.g. Amber Electric). It uses your full NEM12 interval meter data, not just EV charging sessions.
 
-`nem12_wholesale.py` reads 1–2 years of 5-minute interval meter data (NEM12 format, available from your retailer) and calculates what your entire household electricity bill would have looked like on a wholesale pass-through plan, using actual AEMO spot prices. It compares against your real quarterly bills to give a definitive answer on whether switching would save money.
+`nem12_wholesale.py` reads 1–2 years of 30-minute interval meter data (NEM12 format, available from your retailer) and runs a three-way comparison using actual AEMO spot prices and your real quarterly bills.
 
+**Wholesale only:**
 ```bash
 python nem12_wholesale.py nem12_file.csv --region VIC --fixed-rate 0.437 --bill-csv bills.csv
 ```
 
+**Three-way comparison including a TOU plan (e.g. OVO):**
+```bash
+python nem12_wholesale.py nem12_file.csv --region VIC --bill-csv bills.csv \
+    --tou-peak-rate 0.29381 --tou-offpeak-rate 0.045 \
+    --tou-supply-rate 0.946 --tou-feedin-rate 0.01
+```
+
 Key outputs:
-- **Cost comparison** — total import cost at spot vs fixed rate, including solar feed-in at spot (which can be negative during oversupply)
-- **Monthly breakdown** — month-by-month spot vs fixed with EA and Amber feed-in side by side, showing which months are risky (cold-snap winter peaks) vs cheap (solar oversupply)
-- **Actual bill comparison** — your real quarterly bills vs what Amber would have charged for the same period, net of govt relief and supply charges
+- **Usage summary** — total import and solar export kWh with avg kWh/day and annualised kWh/yr figures (useful for entering into retailer quote forms)
+- **Cost comparison** — fixed vs TOU vs wholesale over the full period, including solar feed-in
+- **Monthly breakdown** — month-by-month showing TOU-save and Amber-save vs your fixed rate, with average spot price. Highlights months where wholesale was risky (e.g. June 2025 at 45c avg)
+- **Actual bill comparison** — your real quarterly bills vs what OVO and Amber would have cost, net of govt relief and supply charges
+
+**Note on TOU savings:** The TOU columns reflect your *historical* consumption pattern. If you shift EV charging into the off-peak window (e.g. midnight–6am at 4.5c), real-world savings will be materially higher than shown.
 
 For full usage, arguments, and interpretation see [docs/NEM12_WHOLESALE.md](docs/NEM12_WHOLESALE.md).
 
