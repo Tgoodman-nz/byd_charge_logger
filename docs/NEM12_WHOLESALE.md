@@ -1,8 +1,12 @@
 # NEM12 Wholesale Cost Comparison
 
-`nem12_wholesale.py` reads a NEM12 interval meter file from your retailer and answers the question: **would I have paid less on a wholesale electricity plan (e.g. Amber) over the past 1–2 years?**
+`nem12_wholesale.py` reads a NEM12 interval meter file from your retailer and answers the question: **would I have paid less on a wholesale or time-of-use (TOU) plan over the past 1–2 years?**
 
-It fetches actual AEMO spot prices for your full data period, calculates what grid import would have cost at spot + network rates, adds supply charge and subscription, and compares against your actual bills.
+It fetches actual AEMO spot prices for your full data period and supports three-way comparison:
+
+- **Fixed** — your current flat tariff (e.g. Energy Australia Flexi Saver)
+- **TOU** — a time-of-use plan with a cheap off-peak window (e.g. OVO with 4.5c/kWh midnight–6am)
+- **Wholesale** — spot pass-through plan (e.g. Amber) at AEMO prices + network charge
 
 ---
 
@@ -18,8 +22,16 @@ It fetches actual AEMO spot prices for your full data period, calculates what gr
 
 ## Quick Start
 
+**Wholesale comparison only:**
 ```bash
 py nem12_wholesale.py nem12_file.csv --region VIC --fixed-rate 0.437 --bill-csv bills.csv
+```
+
+**Three-way comparison including OVO TOU:**
+```bash
+py nem12_wholesale.py nem12_file.csv --region VIC --bill-csv bills.csv \
+    --tou-peak-rate 0.29381 --tou-offpeak-rate 0.045 \
+    --tou-supply-rate 0.946 --tou-feedin-rate 0.01
 ```
 
 AEMO price data downloads automatically and is cached locally — subsequent runs are fast.
@@ -40,6 +52,17 @@ AEMO price data downloads automatically and is cached locally — subsequent run
 | `--bill-csv` | *(optional)* | Path to `bills.csv` for actual bill comparison |
 | `--register` | E1 | NEM12 register to analyse: `E1` = grid import, `B1` = solar export |
 | `--aemo-cache-dir` | `aemo_cache` | Directory for cached AEMO price files |
+
+**TOU plan arguments** (all optional — TOU comparison is enabled by providing `--tou-peak-rate`):
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--tou-peak-rate` | *(disabled)* | TOU peak rate $/kWh — enables TOU comparison (e.g. `0.29381` for OVO) |
+| `--tou-offpeak-rate` | 0.045 | TOU off-peak rate $/kWh (e.g. OVO EV rate) |
+| `--tou-offpeak-start` | 0 | Off-peak window start hour 0–23 (default `0` = midnight) |
+| `--tou-offpeak-end` | 6 | Off-peak window end hour 0–23 (default `6` = 6am) |
+| `--tou-supply-rate` | same as `--supply-rate` | TOU plan daily supply $/day excl. GST |
+| `--tou-feedin-rate` | 0.01 | TOU plan feed-in tariff $/kWh |
 
 ---
 
@@ -99,11 +122,13 @@ High-level summary over the full data period:
 
 ### Monthly Breakdown
 
-Per-month energy comparison showing import kWh, fixed cost, wholesale cost, EA feed-in credit (at your fixed rate), Amber feed-in (at spot), net saving, and consumption-weighted average spot price.
+Per-month energy comparison showing import kWh, fixed cost, TOU cost (if enabled), wholesale cost, saving vs fixed for each plan, and consumption-weighted average spot price.
 
-**Note:** The Saving column is energy-only — it does not include supply charge, subscription, or GST. Use the Actual Bill Comparison for the real-world answer.
+**Note:** The save columns are energy-only — they do not include supply charge, subscription, or GST. Use the Actual Bill Comparison for the real-world answer.
 
-June 2025 at 45.1c average shows what a cold-snap winter period looks like — high heating demand drove spot prices well above the fixed rate.
+June 2025 at 45.1c average shows what a cold-snap winter period looks like — high heating demand drove spot prices well above the fixed rate. In that month Amber cost $192 *more* than the fixed rate while OVO remained cheaper.
+
+**TOU save column caveat:** TOU savings are calculated against your *historical* consumption pattern. If you shift EV charging or other large loads into the off-peak window (midnight–6am), actual TOU savings will be materially higher than shown.
 
 ### Spot Price Distribution
 
@@ -115,27 +140,33 @@ Shows what percentage of your consumption fell in each spot price band. Useful f
 
 ### Actual Bill Comparison
 
-Compares what you actually paid EA (after discount and govt relief) against what Amber would have cost for the same period:
+Compares what you actually paid EA (after discount and govt relief) against what OVO and/or Amber would have cost for the same period:
 
 ```
-  Period                  Days   EA paid    Relief  Amber est     Saving
-                                (net rel)          (net rel)
-  ────────────────────────────────────────────────────────────────────────────────
-  2025-09-22→2025-12-22     92   $ 724.17   $75.00  $  508.96   +$215.21
-  2025-12-23→2026-03-22     90  $ 1102.53        -  $  721.39   +$381.14
+  Period                  Days    EA paid   Relief    OVO est   OVO-save  Amber est   Amb-save
+                                (net rel)           (net rel)             (net rel)
+  ──────────────────────────────────────────────────────────────────────────────────────────────
+  2025-09-22→2025-12-22     92  $  724.17   $75.00  $  554.82   +$169.35  $  508.96   +$215.21
+  2025-12-23→2026-03-22     90  $ 1102.53        -  $  876.92   +$225.61  $  721.39   +$381.14
 ```
+
+**OVO estimate includes:** TOU energy cost (peak/off-peak split from NEM12 intervals) − feed-in credit + TOU supply charge, all × 1.1 GST, minus govt relief.
 
 **Amber estimate includes:** wholesale import cost − Amber feed-in credit + supply charge + subscription, all × 1.1 GST, minus govt relief.
 
 **EA paid:** actual amount paid after pay-on-time discount and govt relief.
 
-Both are net of govt relief so the Saving column reflects a clean energy cost comparison.
+All estimates are net of govt relief so the saving columns reflect a clean energy cost comparison.
 
 ---
 
 ## Key Caveats
 
-**Solar feed-in:** The feed-in comparison highlights a key risk for solar households on wholesale plans. Negative spot prices cluster during sunny midday hours — exactly when solar export is highest. On Amber, those negative-price intervals cost you money; on a fixed plan you always receive the guaranteed feed-in rate. The more solar you have, the more this matters.
+**TOU off-peak savings are conservative:** The TOU comparison applies off-peak rates only to consumption that *already* falls in the midnight–6am window in your historical NEM12 data. If you shift EV charging, hot water, or other large loads into that window after switching, real-world savings will be significantly higher. OVO's 4.5c EV rate vs ~29c peak is the primary reason to switch — that benefit won't appear in the historical comparison.
+
+**Wholesale volatility:** Amber saves money in most months when wholesale prices are low (6–18c avg), but a single high-price event can wipe out months of savings. June 2025 (45c avg spot in VIC) cost $192 more than the fixed rate in one month alone. OVO's fixed TOU rates eliminate this risk.
+
+**Solar feed-in:** Negative spot prices cluster during sunny midday hours — exactly when solar export is highest. On Amber, those intervals cost you money; on a fixed plan you always receive the guaranteed feed-in rate. OVO's fixed feed-in rate (typically 1c/kWh) is low but at least predictable. The more solar you export, the more Amber's negative-price risk matters.
 
 **Pay-on-time discount:** A 25% discount (as offered by Energy Australia) significantly reduces your effective fixed rate. This makes wholesale plans harder to beat than the headline tariff suggests.
 
