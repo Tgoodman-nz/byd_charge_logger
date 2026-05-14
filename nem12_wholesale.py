@@ -3,11 +3,17 @@ nem12_wholesale.py — NEM12 interval meter data vs AEMO wholesale cost comparis
 ==================================================================================
 Reads a NEM12 CSV from your retailer (e.g. Energy Australia) and calculates what
 you would have paid on an AEMO spot pass-through plan (e.g. Amber) vs your current
-fixed tariff, across the full history in the file.
+fixed tariff, across the full history in the file. Optionally adds a TOU plan
+(e.g. OVO) as a third comparison using --tou-peak-rate.
 
 Usage:
     python nem12_wholesale.py data.csv --region VIC
     python nem12_wholesale.py data.csv --region VIC --fixed-rate 0.32 --network-rate 0.10
+
+    # Three-way comparison — EA flat vs OVO TOU vs Amber wholesale:
+    python nem12_wholesale.py data.csv --region VIC --bill-csv bills.csv \\
+        --tou-peak-rate 0.2938 --tou-offpeak-rate 0.045 \\
+        --tou-supply-rate 0.86 --tou-feedin-rate 0.01
 
 Arguments:
     nem12_file        NEM12 CSV from your retailer
@@ -18,6 +24,14 @@ Arguments:
     --subscription    Monthly plan fee $ for wholesale retailer e.g. Amber (default: 18.00)
     --aemo-cache-dir  Directory for cached AEMO price files (default: aemo_cache)
 
+    TOU comparison (optional — adds a third plan to all output tables):
+    --tou-peak-rate      TOU peak rate $/kWh — enables TOU comparison (e.g. 0.2938 for OVO)
+    --tou-offpeak-rate   TOU off-peak rate $/kWh (default: 0.045)
+    --tou-offpeak-start  Off-peak window start hour 0–23 (default: 0 = midnight)
+    --tou-offpeak-end    Off-peak window end hour 0–23 (default: 6 = 6am)
+    --tou-supply-rate    TOU plan daily supply $/day excl. GST (default: same as --supply-rate)
+    --tou-feedin-rate    TOU plan feed-in tariff $/kWh (default: 0.01)
+
 Notes:
     - NEM12 data uses NEM time (UTC+10, no daylight saving). AEMO prices are also
       in NEM time so no conversion is needed.
@@ -25,7 +39,9 @@ Notes:
       and is not included here.
     - Intervals with no AEMO price data (rare for historical data) fall back to the
       fixed rate for the wholesale cost estimate.
-    - Daily supply charge is identical on both plans and is excluded from the comparison.
+    - TOU cost estimates use your historical consumption pattern. If you would shift
+      EV or other loads to off-peak, actual TOU savings would be higher than shown.
+    - Supply charges are included in the bill comparison but excluded from energy-only totals.
 """
 
 import argparse
@@ -195,7 +211,24 @@ def main() -> None:
     parser.add_argument("--supply-rate", type=float, default=1.68, metavar="RATE",
                         help="Daily supply charge $/day excl. GST added to Amber estimate "
                              "(default 1.68 — check your bill)")
+    # TOU plan comparison (optional — enabled by providing --tou-peak-rate)
+    parser.add_argument("--tou-peak-rate",     type=float, default=None,  metavar="RATE",
+                        help="TOU plan peak rate $/kWh — enables TOU comparison (e.g. 0.2938 for OVO)")
+    parser.add_argument("--tou-offpeak-rate",  type=float, default=0.045, metavar="RATE",
+                        help="TOU plan off-peak rate $/kWh (default 0.045)")
+    parser.add_argument("--tou-offpeak-start", type=int,   default=0,     metavar="HOUR",
+                        help="Off-peak window start hour 0-23 (default 0 = midnight)")
+    parser.add_argument("--tou-offpeak-end",   type=int,   default=6,     metavar="HOUR",
+                        help="Off-peak window end hour 0-23 (default 6 = 6am)")
+    parser.add_argument("--tou-supply-rate",   type=float, default=None,  metavar="RATE",
+                        help="TOU plan daily supply $/day excl. GST (default: same as --supply-rate)")
+    parser.add_argument("--tou-feedin-rate",   type=float, default=0.01,  metavar="RATE",
+                        help="TOU plan feed-in tariff $/kWh (default 0.01)")
     args = parser.parse_args()
+
+    if args.tou_supply_rate is None:
+        args.tou_supply_rate = args.supply_rate
+    tou_enabled = args.tou_peak_rate is not None
 
     print("\nNEM12 Wholesale Cost Comparison")
     print("═" * 56)
@@ -217,12 +250,13 @@ def main() -> None:
     print(f"  Period:      {date_from} → {date_to}  ({n_days} days, {n_months} months)")
     print(f"  Intervals:   {len(intervals):,}  ({interval_min}-min)")
     print(f"  Total usage: {total_kwh:.1f} kWh  "
-          f"(avg {total_kwh/n_days:.2f} kWh/day)")
+          f"(avg {total_kwh/n_days:.2f} kWh/day,  {total_kwh/n_days*365:.0f} kWh/yr)")
 
     _, _, export_intervals = parse_nem12(args.nem12_file, register="B1")
     if export_intervals:
         total_export_kwh = sum(kwh for _, kwh in export_intervals)
-        print(f"  Solar export:  {total_export_kwh:.1f} kWh (B1, {len(export_intervals):,} intervals)")
+        print(f"  Solar export:  {total_export_kwh:.1f} kWh (B1, {len(export_intervals):,} intervals)  "
+              f"(avg {total_export_kwh/n_days:.2f} kWh/day,  {total_export_kwh/n_days*365:.0f} kWh/yr)")
 
     spot_lookup = build_spot_lookup(
         intervals, args.region, Path(args.aemo_cache_dir), interval_min)
@@ -235,16 +269,18 @@ def main() -> None:
               f"falling back to fixed rate for those")
 
     bills    = load_bills(args.bill_csv) if args.bill_csv else []
-    bill_acc = [{"kwh": 0.0, "wholesale": 0.0, "feedin_amber": 0.0} for _ in bills]
+    bill_acc = [{"kwh": 0.0, "wholesale": 0.0, "feedin_amber": 0.0,
+                 "tou": 0.0, "feedin_tou": 0.0} for _ in bills]
 
     # ── Per-interval cost calculation ────────────────────────────────────────
     fixed_total     = 0.0
     wholesale_total = 0.0
+    tou_total       = 0.0
 
     monthly: dict = defaultdict(lambda: {
-        "kwh": 0.0, "fixed": 0.0, "wholesale": 0.0,
+        "kwh": 0.0, "fixed": 0.0, "wholesale": 0.0, "tou": 0.0,
         "weighted_spot": 0.0, "kwh_priced": 0.0,
-        "feedin": 0.0, "export_kwh": 0.0,
+        "feedin": 0.0, "feedin_tou": 0.0, "export_kwh": 0.0,
     })
 
     bands = [
@@ -273,8 +309,19 @@ def main() -> None:
             wholesale_cost = fixed_cost
             spot_c_kwh     = args.fixed_rate * 100
 
+        if tou_enabled:
+            start_hour = (end_dt - timedelta(minutes=interval_min)).hour
+            if args.tou_offpeak_start < args.tou_offpeak_end:
+                is_offpeak = args.tou_offpeak_start <= start_hour < args.tou_offpeak_end
+            else:
+                is_offpeak = start_hour >= args.tou_offpeak_start or start_hour < args.tou_offpeak_end
+            tou_cost = kwh * (args.tou_offpeak_rate if is_offpeak else args.tou_peak_rate)
+        else:
+            tou_cost = 0.0
+
         fixed_total     += fixed_cost
         wholesale_total += wholesale_cost
+        tou_total       += tou_cost
 
         if bills:
             d = (end_dt - timedelta(minutes=interval_min)).date()
@@ -282,12 +329,14 @@ def main() -> None:
                 if b["start"] <= d <= b["end"]:
                     bill_acc[bi]["kwh"]       += kwh
                     bill_acc[bi]["wholesale"] += wholesale_cost
+                    bill_acc[bi]["tou"]       += tou_cost
                     break
 
         mk = end_dt.strftime("%Y-%m")
         monthly[mk]["kwh"]       += kwh
         monthly[mk]["fixed"]     += fixed_cost
         monthly[mk]["wholesale"] += wholesale_cost
+        monthly[mk]["tou"]       += tou_cost
         if rrp_mwh is not None:
             monthly[mk]["weighted_spot"] += spot_c_kwh * kwh
             monthly[mk]["kwh_priced"]    += kwh
@@ -298,22 +347,29 @@ def main() -> None:
                 band_cost[name] += wholesale_cost
                 break
 
-    # ── Solar export (B1) feed-in at spot ────────────────────────────────────
+    # ── Solar export (B1) feed-in ─────────────────────────────────────────────
     feedin_total_amber = 0.0
+    feedin_total_tou   = 0.0
     for end_dt, kwh_exp in export_intervals:
         rrp_mwh = spot_lookup.get(end_dt)
-        if rrp_mwh is None:
-            continue
-        feedin = kwh_exp * (rrp_mwh / 1000)
-        feedin_total_amber += feedin
         mk = end_dt.strftime("%Y-%m")
-        monthly[mk]["feedin"]     += feedin
         monthly[mk]["export_kwh"] += kwh_exp
+        if rrp_mwh is not None:
+            feedin = kwh_exp * (rrp_mwh / 1000)
+            feedin_total_amber       += feedin
+            monthly[mk]["feedin"]    += feedin
+        if tou_enabled:
+            feedin_tou                   = kwh_exp * args.tou_feedin_rate
+            feedin_total_tou             += feedin_tou
+            monthly[mk]["feedin_tou"]    += feedin_tou
         if bills:
             d = (end_dt - timedelta(minutes=interval_min)).date()
             for bi, b in enumerate(bills):
                 if b["start"] <= d <= b["end"]:
-                    bill_acc[bi]["feedin_amber"] += feedin
+                    if rrp_mwh is not None:
+                        bill_acc[bi]["feedin_amber"] += kwh_exp * (rrp_mwh / 1000)
+                    if tou_enabled:
+                        bill_acc[bi]["feedin_tou"]   += kwh_exp * args.tou_feedin_rate
                     break
 
     subscription_total   = n_months * args.subscription
@@ -327,6 +383,13 @@ def main() -> None:
     print(f"\n{'COST COMPARISON':^{W}}")
     print("═" * W)
     print(f"  Fixed rate ({args.fixed_rate*100:.1f}c/kWh):              ${fixed_total:>8.2f}")
+    if tou_enabled:
+        tou_net = tou_total - feedin_total_tou
+        print(f"  TOU plan ({args.tou_peak_rate*100:.2f}c peak / {args.tou_offpeak_rate*100:.2f}c off-peak):")
+        print(f"    Import cost:                   ${tou_total:>8.2f}")
+        if export_intervals:
+            print(f"    Feed-in ({args.tou_feedin_rate*100:.2f}c/kWh):         ${feedin_total_tou:>8.2f}")
+        print(f"    Total (energy only):           ${tou_net:>8.2f}")
     print(f"  Wholesale (spot + {args.network_rate*100:.0f}c network):")
     print(f"    Import cost:                   ${wholesale_total:>8.2f}")
     if export_intervals:
@@ -337,6 +400,10 @@ def main() -> None:
     print(f"    Total:                         ${amber_net:>8.2f}")
     print("  " + "─" * (W - 2))
 
+    if tou_enabled:
+        tou_vs_fixed = fixed_total - tou_net
+        print(f"  TOU vs fixed:    {'CHEAPER' if tou_vs_fixed >= 0 else 'MORE EXP.'} "
+              f"by ${abs(tou_vs_fixed):.2f} over {n_months} months (energy only, excl. supply)")
     saving_incl_fi = fixed_total - amber_net
     if saving_incl_fi >= 0:
         print(f"  Wholesale CHEAPER by ${saving_incl_fi:.2f} over {n_months} months (incl. sub + feed-in)")
@@ -346,24 +413,47 @@ def main() -> None:
     print(f"  Consumption-weighted avg spot:  {avg_spot_all:.1f}c/kWh")
 
     # ── Monthly breakdown ─────────────────────────────────────────────────────
-    WM = 82
-    print(f"\n{'MONTHLY BREAKDOWN':^{WM}}")
-    print("═" * WM)
-    print(f"  {'Month':<9} {'kWh':>6} {'Fixed':>8} {'Wholesale':>10} "
-          f"{'EA f/in':>8} {'Amb f/in':>9} {'Saving':>9} {'Avg spot':>9}")
-    print("  " + "─" * (WM - 2))
-    for mk in sorted(monthly):
-        m        = monthly[mk]
-        ea_fi    = m["export_kwh"] * args.feedin_rate
-        amb_fi   = m["feedin"]
-        saving   = (m["fixed"] - ea_fi) - (m["wholesale"] - amb_fi)
-        avg_s    = (m["weighted_spot"] / m["kwh_priced"]) if m["kwh_priced"] > 0 else 0
-        s_sign   = "+" if saving >= 0 else ""
-        amb_str  = f"+${amb_fi:.2f}" if amb_fi >= 0 else f"-${abs(amb_fi):.2f}"
-        print(f"  {mk:<9} {m['kwh']:>6.1f} ${m['fixed']:>7.2f} ${m['wholesale']:>9.2f} "
-              f" ${ea_fi:>6.2f}  {amb_str:>8}  {s_sign}${saving:>7.2f}  {avg_s:>6.1f}c")
-    print("  " + "─" * (WM - 2))
-    print(f"  Saving = energy only (excl. supply charge, subscription, GST) — see bill comparison for true totals")
+    if tou_enabled:
+        WM = 96
+        print(f"\n{'MONTHLY BREAKDOWN':^{WM}}")
+        print("═" * WM)
+        print(f"  {'Month':<9} {'kWh':>6} {'Fixed':>8} {'TOU':>8} {'Wholesale':>10} "
+              f"{'TOU-save':>9} {'Amb-save':>9} {'Avg spot':>9}")
+        print("  " + "─" * (WM - 2))
+        for mk in sorted(monthly):
+            m       = monthly[mk]
+            ea_fi   = m["export_kwh"] * args.feedin_rate
+            tou_fi  = m["feedin_tou"]
+            amb_fi  = m["feedin"]
+            tou_sav = (m["fixed"] - ea_fi) - (m["tou"] - tou_fi)
+            amb_sav = (m["fixed"] - ea_fi) - (m["wholesale"] - amb_fi)
+            avg_s   = (m["weighted_spot"] / m["kwh_priced"]) if m["kwh_priced"] > 0 else 0
+            ts_sign = "+" if tou_sav >= 0 else ""
+            as_sign = "+" if amb_sav >= 0 else ""
+            print(f"  {mk:<9} {m['kwh']:>6.1f} ${m['fixed']:>7.2f} ${m['tou']:>7.2f} ${m['wholesale']:>9.2f} "
+                  f" {ts_sign}${tou_sav:>7.2f}  {as_sign}${amb_sav:>7.2f}  {avg_s:>6.1f}c")
+        print("  " + "─" * (WM - 2))
+        print(f"  *-save = saving vs fixed rate, energy only (excl. supply, subscription, GST)")
+        print(f"  TOU uses historical consumption — overnight-shifted EV charging would improve TOU-save")
+    else:
+        WM = 82
+        print(f"\n{'MONTHLY BREAKDOWN':^{WM}}")
+        print("═" * WM)
+        print(f"  {'Month':<9} {'kWh':>6} {'Fixed':>8} {'Wholesale':>10} "
+              f"{'EA f/in':>8} {'Amb f/in':>9} {'Saving':>9} {'Avg spot':>9}")
+        print("  " + "─" * (WM - 2))
+        for mk in sorted(monthly):
+            m        = monthly[mk]
+            ea_fi    = m["export_kwh"] * args.feedin_rate
+            amb_fi   = m["feedin"]
+            saving   = (m["fixed"] - ea_fi) - (m["wholesale"] - amb_fi)
+            avg_s    = (m["weighted_spot"] / m["kwh_priced"]) if m["kwh_priced"] > 0 else 0
+            s_sign   = "+" if saving >= 0 else ""
+            amb_str  = f"+${amb_fi:.2f}" if amb_fi >= 0 else f"-${abs(amb_fi):.2f}"
+            print(f"  {mk:<9} {m['kwh']:>6.1f} ${m['fixed']:>7.2f} ${m['wholesale']:>9.2f} "
+                  f" ${ea_fi:>6.2f}  {amb_str:>8}  {s_sign}${saving:>7.2f}  {avg_s:>6.1f}c")
+        print("  " + "─" * (WM - 2))
+        print(f"  Saving = energy only (excl. supply charge, subscription, GST) — see bill comparison for true totals")
 
     # ── Price distribution ────────────────────────────────────────────────────
     print(f"\n{'SPOT PRICE DISTRIBUTION (by consumption)':^{W}}")
@@ -381,15 +471,22 @@ def main() -> None:
 
     # ── Actual bill comparison ────────────────────────────────────────────────
     if bills:
-        W2 = 76
+        W2 = 100 if tou_enabled else 76
         print(f"\n{'ACTUAL BILL COMPARISON':^{W2}}")
         print("═" * W2)
-        print(f"  {'Period':<23} {'Days':>4}  {'EA paid':>9}  {'Relief':>7}  {'Amber est':>9}  {'Saving':>9}")
-        print(f"  {'':23} {'':>4}  {'(net rel)':>9}  {'':>7}  {'(net rel)':>9}")
+        if tou_enabled:
+            print(f"  {'Period':<23} {'Days':>4}  {'EA paid':>9}  {'Relief':>7}  "
+                  f"{'OVO est':>9}  {'OVO-save':>9}  {'Amber est':>9}  {'Amb-save':>9}")
+            print(f"  {'':23} {'':>4}  {'(net rel)':>9}  {'':>7}  "
+                  f"{'(net rel)':>9}  {'':>9}  {'(net rel)':>9}")
+        else:
+            print(f"  {'Period':<23} {'Days':>4}  {'EA paid':>9}  {'Relief':>7}  {'Amber est':>9}  {'Saving':>9}")
+            print(f"  {'':23} {'':>4}  {'(net rel)':>9}  {'':>7}  {'(net rel)':>9}")
         print("  " + "─" * (W2 - 2))
 
         total_paid  = 0.0
         total_amber = 0.0
+        total_ovo   = 0.0
         has_data    = False
 
         for i, b in enumerate(bills):
@@ -408,30 +505,65 @@ def main() -> None:
             sub        = months * args.subscription
             amber_excl = bill_acc[i]["wholesale"] - bill_acc[i]["feedin_amber"] + supply + sub
             amber_incl = amber_excl * 1.1 - b["relief"]
-            saving     = b["paid"] - amber_incl
+            amb_saving = b["paid"] - amber_incl
 
             total_paid  += b["paid"]
             total_amber += amber_incl
             has_data     = True
 
-            period      = f"{b['start']}→{b['end']}"
-            saving_str  = f"+${saving:.2f}" if saving >= 0 else f"-${abs(saving):.2f}"
-            relief_str  = f"${b['relief']:.2f}" if b["relief"] > 0 else "-"
-            print(f"  {period:<23} {days:>4}  ${b['paid']:>8.2f}  {relief_str:>7}  ${amber_incl:>8.2f}  {saving_str:>9}")
+            period     = f"{b['start']}→{b['end']}"
+            relief_str = f"${b['relief']:.2f}" if b["relief"] > 0 else "-"
+
+            if tou_enabled:
+                tou_supply = days * args.tou_supply_rate
+                tou_excl   = bill_acc[i]["tou"] - bill_acc[i]["feedin_tou"] + tou_supply
+                tou_incl   = tou_excl * 1.1 - b["relief"]
+                tou_saving = b["paid"] - tou_incl
+                total_ovo += tou_incl
+                tou_s_str  = f"+${tou_saving:.2f}" if tou_saving >= 0 else f"-${abs(tou_saving):.2f}"
+                amb_s_str  = f"+${amb_saving:.2f}" if amb_saving >= 0 else f"-${abs(amb_saving):.2f}"
+                print(f"  {period:<23} {days:>4}  ${b['paid']:>8.2f}  {relief_str:>7}  "
+                      f"${tou_incl:>8.2f}  {tou_s_str:>9}  ${amber_incl:>8.2f}  {amb_s_str:>9}")
+            else:
+                amb_s_str = f"+${amb_saving:.2f}" if amb_saving >= 0 else f"-${abs(amb_saving):.2f}"
+                print(f"  {period:<23} {days:>4}  ${b['paid']:>8.2f}  {relief_str:>7}  ${amber_incl:>8.2f}  {amb_s_str:>9}")
 
         if has_data:
-            total_saving     = total_paid - total_amber
-            total_saving_str = f"+${total_saving:.2f}" if total_saving >= 0 else f"-${abs(total_saving):.2f}"
             print("  " + "─" * (W2 - 2))
-            print(f"  {'Total':<23} {'':>4}  ${total_paid:>8.2f}  {'':>7}  ${total_amber:>8.2f}  {total_saving_str:>9}")
-            print("═" * W2)
-            if total_saving >= 0:
-                print(f"\n  Amber would have been CHEAPER by ${total_saving:.2f} over this period")
+            if tou_enabled:
+                tou_tot_sav = total_paid - total_ovo
+                amb_tot_sav = total_paid - total_amber
+                tou_s_str   = f"+${tou_tot_sav:.2f}" if tou_tot_sav >= 0 else f"-${abs(tou_tot_sav):.2f}"
+                amb_s_str   = f"+${amb_tot_sav:.2f}" if amb_tot_sav >= 0 else f"-${abs(amb_tot_sav):.2f}"
+                print(f"  {'Total':<23} {'':>4}  ${total_paid:>8.2f}  {'':>7}  "
+                      f"${total_ovo:>8.2f}  {tou_s_str:>9}  ${total_amber:>8.2f}  {amb_s_str:>9}")
             else:
-                print(f"\n  Amber would have been MORE EXPENSIVE by ${abs(total_saving):.2f} over this period")
-        print(f"\n  Amber est = wholesale energy + supply (${args.supply_rate:.2f}/day) "
+                tot_sav     = total_paid - total_amber
+                tot_sav_str = f"+${tot_sav:.2f}" if tot_sav >= 0 else f"-${abs(tot_sav):.2f}"
+                print(f"  {'Total':<23} {'':>4}  ${total_paid:>8.2f}  {'':>7}  ${total_amber:>8.2f}  {tot_sav_str:>9}")
+            print("═" * W2)
+            if tou_enabled:
+                ovo_verdict = "CHEAPER" if total_ovo < total_paid else "MORE EXPENSIVE"
+                print(f"\n  OVO would have been {ovo_verdict} by ${abs(total_paid - total_ovo):.2f} "
+                      f"over this period (historical pattern — see note below)")
+                amb_verdict = "CHEAPER" if total_amber < total_paid else "MORE EXPENSIVE"
+                print(f"  Amber would have been {amb_verdict} by ${abs(total_paid - total_amber):.2f} "
+                      f"over this period")
+            else:
+                amb_verdict = "CHEAPER" if total_amber < total_paid else "MORE EXPENSIVE"
+                print(f"\n  Amber would have been {amb_verdict} by ${abs(total_paid - total_amber):.2f} "
+                      f"over this period")
+
+        if tou_enabled:
+            print(f"\n  OVO est  = TOU energy ({args.tou_peak_rate*100:.2f}c peak / "
+                  f"{args.tou_offpeak_rate*100:.2f}c off-peak, {args.tou_offpeak_start:02d}:00–{args.tou_offpeak_end:02d}:00)")
+            print(f"           + supply (${args.tou_supply_rate:.2f}/day excl. GST) "
+                  f"- feed-in ({args.tou_feedin_rate*100:.2f}c/kWh), incl. 10% GST, net of relief")
+            print(f"  *** OVO estimate reflects your HISTORICAL load pattern. Shifting EV charging")
+            print(f"      and other loads to off-peak hours would materially improve the OVO saving.")
+        print(f"  Amber est = wholesale energy + supply (${args.supply_rate:.2f}/day excl. GST) "
               f"+ sub (${args.subscription:.2f}/mo), incl. 10% GST")
-        print(f"  Both plans: EA paid and Amber est are net of govt relief where applicable")
+        print(f"  Both plans: EA paid and estimates are net of govt relief where applicable")
 
 
 if __name__ == "__main__":
