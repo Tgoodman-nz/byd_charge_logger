@@ -674,11 +674,16 @@ def print_ev_insights(sessions: list[dict], results: list[dict],
     print(f"  {'─'*40}")
     if results:
         total_solar  = sum(r["solar_kwh"] for r in results)
-        total_grid   = sum(r["grid_kwh"]  for r in results)
+        total_peak_grid   = sum(r["peak_kwh"]  for r in results)
+        total_op     = sum(r["offpeak_kwh"]  for r in results)
         total_r_kwh  = sum(r["total_kwh"] for r in results)
         solar_pct    = total_solar / total_r_kwh * 100 if total_r_kwh else 0
+        op_pct       = total_op / total_r_kwh * 100 if total_r_kwh else 0
+        peak_pct     = total_peak_grid / total_r_kwh * 100 if total_r_kwh else 0
         print(f"  Solar charged:               {total_solar:.1f} kWh  ({solar_pct:.0f}%)")
-        print(f"  Grid charged:                {total_grid:.1f} kWh  ({100-solar_pct:.0f}%)")
+        print(f"  Grid Peak charged:           {total_peak_grid:.1f} kWh  ({peak_pct:.0f}%)")
+        print(f"  Off Peak charged:            {total_op:.1f} kWh  ({op_pct:.0f}%)")
+        print(f"  Total kWh:                   {total_r_kwh:.1f} kWh  (100%)")
         print(f"  (Sessions without PowerPal data not included)")
     else:
         print(f"  Run get_powerpal_key.py first to enable solar vs grid split")

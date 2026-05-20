@@ -1,5 +1,6 @@
 .env
 *.csv
+*.db
 session_state.json
 powerpal_ble.json
 run.bat
