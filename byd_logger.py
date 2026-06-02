@@ -281,8 +281,10 @@ def get_realtime_fields(realtime):
     return {
         "is_charging":   is_charging,
         "charge_state":  charge_state,
-        "soc":           getattr(realtime, "elec_percent", None),
-        "odo":           getattr(realtime, "total_mileage", None),
+        # Treat 0 as None — the API transiently zeroes these fields when chargeState changes.
+        # A 0 odometer or 0% SOC is never valid for a car in use.
+        "soc":           getattr(realtime, "elec_percent", None) or None,
+        "odo":           getattr(realtime, "total_mileage", None) or None,
         "range_km":      getattr(realtime, "endurance_mileage_v2", None),
         "lifetime_eff":  raw.get("totalConsumptionEn", ""),
         "speed":         getattr(realtime, "speed", None),
@@ -382,6 +384,10 @@ async def run_polling_session(config, session_count, odo_last_charge):
             log.info("Continuing in-progress session from %s",
                      to_local(session_start).strftime("%H:%M local"))
 
+        # Fallback values for when the API transiently returns 0 for soc/odo
+        last_valid_soc = soc_at_start
+        last_valid_odo = odo_at_start
+
         while True:
             try:
                 realtime = await asyncio.wait_for(
@@ -396,11 +402,16 @@ async def run_polling_session(config, session_count, odo_last_charge):
                 now_utc     = datetime.now(timezone.utc)
                 now_local   = to_local(now_utc)
 
+                if soc:
+                    last_valid_soc = soc
+                if odo:
+                    last_valid_odo = odo
+
                 if is_charging and not was_charging:
                     # ── Session started ──
                     session_start  = now_utc
-                    soc_at_start   = soc
-                    odo_at_start   = odo
+                    soc_at_start   = soc or last_valid_soc
+                    odo_at_start   = odo or last_valid_odo
                     power_readings = [gl_watts] if gl_watts > 0 else []
                     session_lat = session_lon = None
                     try:
@@ -431,6 +442,13 @@ async def run_polling_session(config, session_count, odo_last_charge):
 
                 elif not is_charging and was_charging and session_start is not None:
                     # ── Session ended ──
+                    soc_end = soc or last_valid_soc
+                    odo_end = odo or last_valid_odo
+                    if soc != soc_end or odo != odo_end:
+                        log.warning("API returned 0 for soc/odo at session end — "
+                                    "using last valid values (soc=%s%%, odo=%s km)",
+                                    soc_end, odo_end)
+
                     duration_min   = round(
                         (now_utc - session_start).total_seconds() / 60, 1)
                     kwh_est        = round(duration_min / 60 * CHARGE_RATE_KW, 3)
@@ -464,14 +482,14 @@ async def run_polling_session(config, session_count, odo_last_charge):
                         "end_time_utc":                      now_utc.strftime("%H:%M:%S"),
                         "duration_minutes":                  duration_min,
                         "soc_start_pct":                     soc_at_start,
-                        "soc_end_pct":                       soc,
-                        "soc_delta_pct":                     (soc - soc_at_start)
-                                                             if (soc and soc_at_start) else "",
+                        "soc_end_pct":                       soc_end,
+                        "soc_delta_pct":                     (soc_end - soc_at_start)
+                                                             if (soc_end and soc_at_start) else "",
                         "kwh_charged_estimated":             kwh_est,
                         "kwh_charged_actual":                kwh_actual or "",
                         "avg_charge_power_w":                avg_power or "",
                         "odo_start_km":                      odo_at_start,
-                        "odo_end_km":                        odo,
+                        "odo_end_km":                        odo_end,
                         "km_driven_since_last_charge":       km_driven,
                         "range_km":                          fields["range_km"],
                         "efficiency_kwh_per_100km":          efficiency,
@@ -481,7 +499,7 @@ async def run_polling_session(config, session_count, odo_last_charge):
                     })
 
                     clear_session_state()
-                    odo_last_charge = odo
+                    odo_last_charge = odo_end or odo_last_charge
                     session_start   = None
                     soc_at_start    = None
                     odo_at_start    = None
@@ -490,7 +508,7 @@ async def run_polling_session(config, session_count, odo_last_charge):
                     session_lon     = None
                     log.info("✅ Charging ended  SOC=%s%%  ODO=%s km  "
                              "duration=%s min  actual=%s kWh  avg=%sW",
-                             soc, odo, duration_min,
+                             soc_end, odo_end, duration_min,
                              kwh_actual or "n/a", avg_power or "n/a")
 
                 else:

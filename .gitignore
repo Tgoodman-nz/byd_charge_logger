@@ -10,3 +10,4 @@ cert.pem
 key.pem
 amber_cache.csv
 aemo_cache/
+status.json
