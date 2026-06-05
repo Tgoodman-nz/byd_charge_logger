@@ -40,8 +40,9 @@ UTC_OFFSET_HOURS   = int(os.getenv("UTC_OFFSET_HOURS", "10"))
 HOME_RADIUS_M      = int(os.getenv("HOME_RADIUS_M",    "500"))
 GPS_SESSIONS_FILE  = os.getenv("GPS_SESSIONS_FILE",  "/opt/byd_logger/gps_sessions.json")
 HOME_LOCATION_FILE = os.getenv("HOME_LOCATION_FILE", "/opt/byd_logger/home_location.json")
-REQUEST_TIMEOUT  = 30
-RECONNECT_DELAY  = 60
+REQUEST_TIMEOUT       = 30
+RECONNECT_DELAY       = 60
+CHARGE_STATE_DEBOUNCE = int(os.getenv("CHARGE_STATE_DEBOUNCE", "2"))
 # ───────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -130,15 +131,17 @@ def append_session(row: dict) -> None:
 # ── Session state persistence ───────────────────────────────────────────────
 
 def save_session_state(session_start: datetime, soc_at_start, odo_at_start,
-                       power_readings: list, session_lat=None, session_lon=None) -> None:
+                       power_readings: list, session_lat=None, session_lon=None,
+                       not_charging_count: int = 0) -> None:
     """Write current in-progress session to disk."""
     state = {
-        "session_start_utc": session_start.isoformat(),
-        "soc_at_start":      soc_at_start,
-        "odo_at_start":      odo_at_start,
-        "power_readings":    power_readings,
-        "session_lat":       session_lat,
-        "session_lon":       session_lon,
+        "session_start_utc":  session_start.isoformat(),
+        "soc_at_start":       soc_at_start,
+        "odo_at_start":       odo_at_start,
+        "power_readings":     power_readings,
+        "session_lat":        session_lat,
+        "session_lon":        session_lon,
+        "not_charging_count": not_charging_count,
     }
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
@@ -147,7 +150,7 @@ def save_session_state(session_start: datetime, soc_at_start, odo_at_start,
 def load_session_state():
     """Load in-progress session from disk if it exists."""
     if not Path(STATE_FILE).exists():
-        return None, None, None, [], None, None
+        return None, None, None, [], None, None, 0
     try:
         with open(STATE_FILE) as f:
             state = json.load(f)
@@ -161,10 +164,11 @@ def load_session_state():
                 state["odo_at_start"],
                 state.get("power_readings", []),
                 state.get("session_lat"),
-                state.get("session_lon"))
+                state.get("session_lon"),
+                state.get("not_charging_count", 0))
     except Exception as e:
         log.warning("Could not load session state: %s", e)
-        return None, None, None, [], None, None
+        return None, None, None, [], None, None, 0
 
 
 def clear_session_state() -> None:
@@ -377,7 +381,7 @@ async def run_polling_session(config, session_count, odo_last_charge):
 
         # Restore any in-progress session from disk
         session_start, soc_at_start, odo_at_start, power_readings, \
-            session_lat, session_lon = load_session_state()
+            session_lat, session_lon, not_charging_count = load_session_state()
         was_charging = session_start is not None
 
         if was_charging:
@@ -409,6 +413,7 @@ async def run_polling_session(config, session_count, odo_last_charge):
 
                 if is_charging and not was_charging:
                     # ── Session started ──
+                    not_charging_count = 0
                     session_start  = now_utc
                     soc_at_start   = soc or last_valid_soc
                     odo_at_start   = odo or last_valid_odo
@@ -430,94 +435,115 @@ async def run_polling_session(config, session_count, odo_last_charge):
                     log.info("⚡ Charging started  SOC=%s%%  ODO=%s km  "
                              "power=%.0fW  local=%s",
                              soc, odo, gl_watts, now_local.strftime("%H:%M"))
+                    was_charging = True
 
                 elif is_charging and was_charging:
-                    # ── Session ongoing ──
+                    # ── Session ongoing (or glitch recovered) ──
+                    if not_charging_count > 0:
+                        log.warning(
+                            "chargeState recovered after %d poll(s) — "
+                            "API glitch absorbed, session continues  SOC=%s%%  ODO=%s km",
+                            not_charging_count,
+                            soc or last_valid_soc, odo or last_valid_odo)
+                    not_charging_count = 0
                     if gl_watts > 0:
                         power_readings.append(gl_watts)
-                    # Update persisted power readings periodically
                     save_session_state(session_start, soc_at_start,
                                        odo_at_start, power_readings,
                                        session_lat, session_lon)
 
                 elif not is_charging and was_charging and session_start is not None:
-                    # ── Session ended ──
-                    soc_end = soc or last_valid_soc
-                    odo_end = odo or last_valid_odo
-                    if soc != soc_end or odo != odo_end:
-                        log.warning("API returned 0 for soc/odo at session end — "
-                                    "using last valid values (soc=%s%%, odo=%s km)",
-                                    soc_end, odo_end)
+                    not_charging_count += 1
+                    if not_charging_count < CHARGE_STATE_DEBOUNCE:
+                        # ── Possible glitch — hold session open ──
+                        log.warning(
+                            "chargeState=0 (poll %d/%d) — holding session open, "
+                            "may be API glitch  SOC=%s%%  ODO=%s km",
+                            not_charging_count, CHARGE_STATE_DEBOUNCE,
+                            soc or last_valid_soc, odo or last_valid_odo)
+                        save_session_state(session_start, soc_at_start,
+                                           odo_at_start, power_readings,
+                                           session_lat, session_lon,
+                                           not_charging_count)
+                    else:
+                        # ── Session ended (confirmed: N consecutive non-charging polls) ──
+                        not_charging_count = 0
+                        soc_end = soc or last_valid_soc
+                        odo_end = odo or last_valid_odo
+                        if soc != soc_end or odo != odo_end:
+                            log.warning("API returned 0 for soc/odo at session end — "
+                                        "using last valid values (soc=%s%%, odo=%s km)",
+                                        soc_end, odo_end)
 
-                    duration_min   = round(
-                        (now_utc - session_start).total_seconds() / 60, 1)
-                    kwh_est        = round(duration_min / 60 * CHARGE_RATE_KW, 3)
-                    session_count += 1
-                    location       = determine_location(
-                        f"S{session_count:04d}", session_lat, session_lon)
-                    start_local    = to_local(session_start)
+                        duration_min   = round(
+                            (now_utc - session_start).total_seconds() / 60, 1)
+                        kwh_est        = round(duration_min / 60 * CHARGE_RATE_KW, 3)
+                        session_count += 1
+                        location       = determine_location(
+                            f"S{session_count:04d}", session_lat, session_lon)
+                        start_local    = to_local(session_start)
 
-                    avg_power  = round(sum(power_readings) / len(power_readings), 0) \
-                                 if power_readings else None
-                    kwh_actual = round(avg_power * (duration_min / 60) / 1000, 3) \
-                                 if avg_power else None
+                        avg_power  = round(sum(power_readings) / len(power_readings), 0) \
+                                     if power_readings else None
+                        kwh_actual = round(avg_power * (duration_min / 60) / 1000, 3) \
+                                     if avg_power else None
 
-                    km_driven = ""
-                    if odo_at_start and odo_last_charge:
-                        km_driven = round(odo_at_start - odo_last_charge, 1)
+                        km_driven = ""
+                        if odo_at_start and odo_last_charge:
+                            km_driven = round(odo_at_start - odo_last_charge, 1)
 
-                    efficiency  = ""
-                    kwh_for_eff = kwh_actual or kwh_est
-                    if km_driven and km_driven > 0 and kwh_for_eff > 0:
-                        efficiency = round(kwh_for_eff / km_driven * 100, 1)
+                        efficiency  = ""
+                        kwh_for_eff = kwh_actual or kwh_est
+                        if km_driven and km_driven > 0 and kwh_for_eff > 0:
+                            efficiency = round(kwh_for_eff / km_driven * 100, 1)
 
-                    lifetime_eff = parse_lifetime_efficiency(fields["lifetime_eff"])
+                        lifetime_eff = parse_lifetime_efficiency(fields["lifetime_eff"])
 
-                    append_session({
-                        "session_id":                        f"S{session_count:04d}",
-                        "date_local":                        start_local.strftime("%Y-%m-%d"),
-                        "start_time_local":                  start_local.strftime("%H:%M:%S"),
-                        "end_time_local":                    now_local.strftime("%H:%M:%S"),
-                        "start_time_utc":                    session_start.strftime("%H:%M:%S"),
-                        "end_time_utc":                      now_utc.strftime("%H:%M:%S"),
-                        "duration_minutes":                  duration_min,
-                        "soc_start_pct":                     soc_at_start,
-                        "soc_end_pct":                       soc_end,
-                        "soc_delta_pct":                     (soc_end - soc_at_start)
-                                                             if (soc_end and soc_at_start) else "",
-                        "kwh_charged_estimated":             kwh_est,
-                        "kwh_charged_actual":                kwh_actual or "",
-                        "avg_charge_power_w":                avg_power or "",
-                        "odo_start_km":                      odo_at_start,
-                        "odo_end_km":                        odo_end,
-                        "km_driven_since_last_charge":       km_driven,
-                        "range_km":                          fields["range_km"],
-                        "efficiency_kwh_per_100km":          efficiency,
-                        "lifetime_efficiency_kwh_per_100km": lifetime_eff,
-                        "location":                          location,
-                        "notes":                             "",
-                    })
+                        append_session({
+                            "session_id":                        f"S{session_count:04d}",
+                            "date_local":                        start_local.strftime("%Y-%m-%d"),
+                            "start_time_local":                  start_local.strftime("%H:%M:%S"),
+                            "end_time_local":                    now_local.strftime("%H:%M:%S"),
+                            "start_time_utc":                    session_start.strftime("%H:%M:%S"),
+                            "end_time_utc":                      now_utc.strftime("%H:%M:%S"),
+                            "duration_minutes":                  duration_min,
+                            "soc_start_pct":                     soc_at_start,
+                            "soc_end_pct":                       soc_end,
+                            "soc_delta_pct":                     (soc_end - soc_at_start)
+                                                                 if (soc_end and soc_at_start) else "",
+                            "kwh_charged_estimated":             kwh_est,
+                            "kwh_charged_actual":                kwh_actual or "",
+                            "avg_charge_power_w":                avg_power or "",
+                            "odo_start_km":                      odo_at_start,
+                            "odo_end_km":                        odo_end,
+                            "km_driven_since_last_charge":       km_driven,
+                            "range_km":                          fields["range_km"],
+                            "efficiency_kwh_per_100km":          efficiency,
+                            "lifetime_efficiency_kwh_per_100km": lifetime_eff,
+                            "location":                          location,
+                            "notes":                             "",
+                        })
 
-                    clear_session_state()
-                    odo_last_charge = odo_end or odo_last_charge
-                    session_start   = None
-                    soc_at_start    = None
-                    odo_at_start    = None
-                    power_readings  = []
-                    session_lat     = None
-                    session_lon     = None
-                    log.info("✅ Charging ended  SOC=%s%%  ODO=%s km  "
-                             "duration=%s min  actual=%s kWh  avg=%sW",
-                             soc_end, odo_end, duration_min,
-                             kwh_actual or "n/a", avg_power or "n/a")
+                        clear_session_state()
+                        odo_last_charge = odo_end or odo_last_charge
+                        session_start   = None
+                        soc_at_start    = None
+                        odo_at_start    = None
+                        power_readings  = []
+                        session_lat     = None
+                        session_lon     = None
+                        was_charging    = False
+                        log.info("✅ Charging ended  SOC=%s%%  ODO=%s km  "
+                                 "duration=%s min  actual=%s kWh  avg=%sW",
+                                 soc_end, odo_end, duration_min,
+                                 kwh_actual or "n/a", avg_power or "n/a")
 
                 else:
+                    not_charging_count = 0
                     log.debug("Status: charging=%s  chargeState=%s  SOC=%s%%  "
                               "ODO=%s km  power=%.0fW  speed=%s km/h",
                               is_charging, fields["charge_state"],
                               soc, odo, gl_watts, fields["speed"])
-
-                was_charging = is_charging
 
             except asyncio.TimeoutError:
                 log.warning("Poll timed out after %ss — reconnecting …",

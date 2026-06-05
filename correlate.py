@@ -254,6 +254,114 @@ def load_sessions(source: str) -> list[dict]:
     return sessions
 
 
+def merge_gap_sessions(sessions: list[dict], gap_minutes: int) -> tuple[list[dict], set[str]]:
+    """Merge consecutive sessions separated by a gap ≤ gap_minutes at the same location.
+
+    Handles the BYD API glitch where chargeState briefly drops to 0 mid-session,
+    causing the logger to close and immediately re-open a session within one poll cycle.
+    Returns (merged_sessions, set_of_all_original_ids_in_any_merge_group).
+    The cache should be invalidated for all returned IDs so the merged windows are re-correlated.
+    """
+    if not sessions or gap_minutes <= 0:
+        return sessions, set()
+
+    sessions_sorted = sorted(sessions, key=lambda s: s["start"])
+    merged_list: list[dict] = []
+    merged_ids:  set[str]   = set()
+
+    i = 0
+    while i < len(sessions_sorted):
+        group = [sessions_sorted[i]]
+
+        while i + 1 < len(sessions_sorted):
+            curr = group[-1]
+            nxt  = sessions_sorted[i + 1]
+            gap  = (nxt["start"] - curr["end"]).total_seconds() / 60
+            same_loc = (curr.get("location") or "H") == (nxt.get("location") or "H")
+            if 0 <= gap <= gap_minutes and same_loc:
+                group.append(nxt)
+                i += 1
+            else:
+                break
+
+        if len(group) == 1:
+            merged_list.append(group[0])
+        else:
+            first = group[0]
+            last  = group[-1]
+            for s in group:
+                merged_ids.add(s["session_id"])
+
+            # Best soc_end: last non-zero value in the group
+            soc_end = last["soc_end"]
+            for s in reversed(group):
+                try:
+                    if s.get("soc_end") and float(s["soc_end"]) > 0:
+                        soc_end = s["soc_end"]
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+            # Best odo: first/last non-zero value
+            odo_start = first.get("odo_start_km", "")
+            if not odo_start or str(odo_start) in ("0", "0.0"):
+                for s in group:
+                    v = s.get("odo_start_km", "")
+                    if v and str(v) not in ("0", "0.0", ""):
+                        odo_start = v
+                        break
+
+            odo_end = last.get("odo_end_km", "")
+            if not odo_end or str(odo_end) in ("0", "0.0"):
+                for s in reversed(group):
+                    v = s.get("odo_end_km", "")
+                    if v and str(v) not in ("0", "0.0", ""):
+                        odo_end = v
+                        break
+
+            # km_driven: first session that has it (represents the trip before this charge)
+            km_driven = first.get("km_driven", "")
+            km_driven_since = first.get("km_driven_since_last_charge", "")
+            if not km_driven:
+                for s in group:
+                    if s.get("km_driven"):
+                        km_driven = s["km_driven"]
+                        km_driven_since = s.get("km_driven_since_last_charge", km_driven)
+                        break
+
+            duration_min = round((last["end"] - first["start"]).total_seconds() / 60, 1)
+            absorbed = ", ".join(s["session_id"] for s in group[1:])
+            print(f"  Merged {len(group)} sessions into {first['session_id']} "
+                  f"(absorbed: {absorbed})")
+
+            merged_list.append({
+                **first,
+                "end":          last["end"],
+                "duration_min": duration_min,
+                "soc_end":      soc_end,
+                "odo_start_km": odo_start,
+                "odo_end_km":   odo_end,
+                "km_driven":    km_driven,
+                "km_driven_since_last_charge": km_driven_since,
+                "kwh_estimated": sum(s["kwh_estimated"] for s in group),
+                "range_km":     last.get("range_km") or first.get("range_km", ""),
+                "lifetime_efficiency_kwh_per_100km": (
+                    last.get("lifetime_efficiency_kwh_per_100km") or
+                    first.get("lifetime_efficiency_kwh_per_100km", "")
+                ),
+            })
+
+        i += 1
+
+    if merged_ids:
+        n_before = len(sessions_sorted)
+        n_after  = len(merged_list)
+        print(f"  Session merge: {n_before} sessions → {n_after} "
+              f"({n_before - n_after} glitch gap(s) collapsed, use --merge-gap 0 to disable)")
+
+    return merged_list, merged_ids
+
+
 def _rates_for_date(date_str: str, schedule: list, defaults: dict) -> dict:
     """Return rates for a session date, using the schedule or falling back to defaults."""
     for entry in schedule:
@@ -1018,6 +1126,8 @@ def main() -> None:
                         help="Persistent PowerPal correlation cache (default correlation_cache.csv)")
     parser.add_argument("--recalculate",     action="store_true",
                         help="Ignore cache and re-fetch PowerPal for all sessions")
+    parser.add_argument("--merge-gap",       type=int,   default=5,   metavar="MINUTES",
+                        help="Merge consecutive sessions with gap ≤ N minutes (API glitch fix, default 5, 0 to disable)")
     parser.add_argument("--rate-schedule",   default=str(DEFAULT_RATE_SCHEDULE_PATH), metavar="FILE",
                         help="CSV of retailer rate periods (default rate_schedule.csv)")
     args = parser.parse_args()
@@ -1039,6 +1149,11 @@ def main() -> None:
 
     cache_path = Path(args.correlation_cache)
     cache = {} if args.recalculate else load_correlation_cache(cache_path)
+
+    if args.merge_gap > 0:
+        sessions, merged_ids = merge_gap_sessions(sessions, args.merge_gap)
+        for sid in merged_ids:
+            cache.pop(sid, None)
 
     # Resolve PowerPal credentials from args or powerpal_ble.json
     serial  = args.powerpal_serial
