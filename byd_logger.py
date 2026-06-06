@@ -285,10 +285,8 @@ def get_realtime_fields(realtime):
     return {
         "is_charging":   is_charging,
         "charge_state":  charge_state,
-        # Treat 0 as None — the API transiently zeroes these fields when chargeState changes.
-        # A 0 odometer or 0% SOC is never valid for a car in use.
-        "soc":           getattr(realtime, "elec_percent", None) or None,
-        "odo":           getattr(realtime, "total_mileage", None) or None,
+        "soc":           getattr(realtime, "elec_percent", None),
+        "odo":           getattr(realtime, "total_mileage", None),
         "range_km":      getattr(realtime, "endurance_mileage_v2", None),
         "lifetime_eff":  raw.get("totalConsumptionEn", ""),
         "speed":         getattr(realtime, "speed", None),
@@ -388,10 +386,6 @@ async def run_polling_session(config, session_count, odo_last_charge):
             log.info("Continuing in-progress session from %s",
                      to_local(session_start).strftime("%H:%M local"))
 
-        # Fallback values for when the API transiently returns 0 for soc/odo
-        last_valid_soc = soc_at_start
-        last_valid_odo = odo_at_start
-
         while True:
             try:
                 realtime = await asyncio.wait_for(
@@ -406,17 +400,19 @@ async def run_polling_session(config, session_count, odo_last_charge):
                 now_utc     = datetime.now(timezone.utc)
                 now_local   = to_local(now_utc)
 
-                if soc:
-                    last_valid_soc = soc
-                if odo:
-                    last_valid_odo = odo
+                if not soc or not odo:
+                    log.warning("Skipping poll — invalid zero values from API  "
+                                "soc=%s odo=%s chargeState=%s",
+                                soc, odo, fields["charge_state"])
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
 
                 if is_charging and not was_charging:
                     # ── Session started ──
                     not_charging_count = 0
                     session_start  = now_utc
-                    soc_at_start   = soc or last_valid_soc
-                    odo_at_start   = odo or last_valid_odo
+                    soc_at_start   = soc
+                    odo_at_start   = odo
                     power_readings = [gl_watts] if gl_watts > 0 else []
                     session_lat = session_lon = None
                     try:
@@ -444,7 +440,7 @@ async def run_polling_session(config, session_count, odo_last_charge):
                             "chargeState recovered after %d poll(s) — "
                             "API glitch absorbed, session continues  SOC=%s%%  ODO=%s km",
                             not_charging_count,
-                            soc or last_valid_soc, odo or last_valid_odo)
+                            soc, odo)
                     not_charging_count = 0
                     if gl_watts > 0:
                         power_readings.append(gl_watts)
@@ -460,7 +456,7 @@ async def run_polling_session(config, session_count, odo_last_charge):
                             "chargeState=0 (poll %d/%d) — holding session open, "
                             "may be API glitch  SOC=%s%%  ODO=%s km",
                             not_charging_count, CHARGE_STATE_DEBOUNCE,
-                            soc or last_valid_soc, odo or last_valid_odo)
+                            soc, odo)
                         save_session_state(session_start, soc_at_start,
                                            odo_at_start, power_readings,
                                            session_lat, session_lon,
@@ -468,12 +464,8 @@ async def run_polling_session(config, session_count, odo_last_charge):
                     else:
                         # ── Session ended (confirmed: N consecutive non-charging polls) ──
                         not_charging_count = 0
-                        soc_end = soc or last_valid_soc
-                        odo_end = odo or last_valid_odo
-                        if soc != soc_end or odo != odo_end:
-                            log.warning("API returned 0 for soc/odo at session end — "
-                                        "using last valid values (soc=%s%%, odo=%s km)",
-                                        soc_end, odo_end)
+                        soc_end = soc
+                        odo_end = odo
 
                         duration_min   = round(
                             (now_utc - session_start).total_seconds() / 60, 1)
@@ -525,7 +517,7 @@ async def run_polling_session(config, session_count, odo_last_charge):
                         })
 
                         clear_session_state()
-                        odo_last_charge = odo_end or odo_last_charge
+                        odo_last_charge = odo_end
                         session_start   = None
                         soc_at_start    = None
                         odo_at_start    = None
