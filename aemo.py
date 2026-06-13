@@ -223,9 +223,44 @@ def _fetch_aemo_month(year: int, month: int, region: str, cache_dir: Path) -> li
         _aemo_month_cache[key] = rows
         return rows
 
-    # Current month — no MMSDM archive yet; use DispatchIS daily ZIPs
-    # (re-downloaded each run so newly published days are always included)
-    return _fetch_via_dispatchis(year, month, region, key)
+    # Current month — no MMSDM archive yet; use DispatchIS daily ZIPs.
+    # Cache to disk incrementally: only fetch days after the last cached date.
+    today_date = today
+    if cached.exists():
+        existing = _read_dispatch_cache(cached)
+        if existing:
+            last_cached_day = max(r["dt"].date() for r in existing)
+            if last_cached_day >= today_date:
+                # Cache is up-to-date
+                _aemo_month_cache[key] = existing
+                return existing
+            # Only fetch the days we don't have yet
+            start_day = last_cached_day.day + 1
+            all_filtered = []
+            for day in range(start_day, today_date.day + 1):
+                d = date(year, month, day)
+                day_url = (f"https://www.nemweb.com.au/Reports/ARCHIVE/DispatchIS_Reports/"
+                           f"PUBLIC_DISPATCHIS_{d.strftime('%Y%m%d')}.zip")
+                try:
+                    with urllib.request.urlopen(day_url, timeout=60) as r:
+                        day_zip = r.read()
+                    day_data = _parse_mmsdm_zip(day_zip, region)
+                    if day_data:
+                        all_filtered.extend(day_data)
+                except Exception as e:
+                    if "404" not in str(e):
+                        print(f"    Warning: could not download {d} — {e}")
+            if all_filtered:
+                print(f"  Fetched {len(all_filtered):,} new dispatch intervals for "
+                      f"{region} {year}-{month:02d} (days {start_day}–{today_date.day})")
+                with open(cached, "a", newline="") as f:
+                    for line in all_filtered:
+                        f.write(line + "\n")
+            rows = _read_dispatch_cache(cached)
+            _aemo_month_cache[key] = rows
+            return rows
+
+    return _fetch_via_dispatchis(year, month, region, key, cache_path=cached)
 
 
 def spot_prices_for_window(start_nem: datetime, end_nem: datetime,

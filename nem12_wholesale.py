@@ -74,7 +74,7 @@ def parse_nem12(path: str,
     """
     nmi             = ""
     interval_min    = 30
-    intervals       = []
+    by_dt: dict[datetime, float] = {}  # keyed by interval end-time; last record wins
     active_register = None  # register of the current 200 block
     active_interval = 30    # interval_min for the current 200 block
 
@@ -107,9 +107,9 @@ def parse_nem12(path: str,
                     except (IndexError, ValueError):
                         kwh = 0.0
                     end_dt = date + timedelta(minutes=(i + 1) * active_interval)
-                    intervals.append((end_dt, kwh))
+                    by_dt[end_dt] = kwh  # last record wins — handles correction records
 
-    intervals.sort(key=lambda x: x[0])
+    intervals = sorted(by_dt.items())
     return nmi, interval_min, intervals
 
 
